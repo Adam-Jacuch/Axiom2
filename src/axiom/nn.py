@@ -62,16 +62,49 @@ def rms_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> Te
 # ==========================================
 
 def mse_loss(preds: Tensor, targets: Tensor) -> Tensor:
-    """Mean Squared Error. Automatically broadcasts topologies if needed."""
+    """Mean Squared Error (L2). Automatically broadcasts topologies."""
     return (preds - targets).pw(jnp.square)
+
+
+def l1_loss(preds: Tensor, targets: Tensor) -> Tensor:
+    """Mean Absolute Error (L1). Automatically broadcasts topologies."""
+    return (preds - targets).pw(jnp.abs)
+
+
+def huber_loss(preds: Tensor, targets: Tensor, delta: float = 1.0) -> Tensor:
+    """
+    Smooth L1 Loss (Huber).
+    Transitions from L2 (MSE) to L1 (MAE) for large errors to prevent exploding gradients.
+    """
+    diff = (preds - targets).pw(jnp.abs)
+    # Use JAX's where condition to smoothly transition
+    return diff.pw(lambda x: jnp.where(x < delta, 0.5 * jnp.square(x), delta * (x - 0.5 * delta)))
 
 
 def bce_with_logits(logits: Tensor, targets: Tensor) -> Tensor:
     """Numerically stable Binary Cross Entropy with Logits."""
-    # max(x, 0) - x * z + log(1 + exp(-abs(x)))
     max_val = logits.pw(lambda x: jnp.clip(x, 0, None))
     log_weight = logits.pw(jnp.abs).pw(lambda x: jnp.log(1 + jnp.exp(-x)))
     return max_val - (logits * targets) + log_weight
+
+
+def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor) -> Tensor:
+    """
+    Categorical Cross Entropy Loss.
+    Requires a TargetedTensor to specify the class/vocab axis!
+    Usage: loss = nn.cross_entropy_loss(logits.vocab, targets_one_hot)
+    """
+    # 1. log_softmax automatically scopes to the targeted axis!
+    log_probs = logits.pw(jax.nn.log_softmax)
+
+    # 2. Multiply by the target distribution
+    loss_tensor = -(targets * log_probs)
+
+    # 3. Sum over the targeted class axis to get the scalar loss per token/batch
+    for a in logits.target_axes:
+        loss_tensor = getattr(loss_tensor, a.name).sum()
+
+    return loss_tensor
 
 
 # ==========================================

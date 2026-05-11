@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 import operator
-from typing import Any, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Type
+
+if TYPE_CHECKING:
+    # PyCharm sees this and loads the autocomplete hints!
+    from ._nn_stubs import NNTensorStubs, NNTargetedTensorStubs, NNTargetedBundleStubs
+else:
+    # At runtime, Python sees these as empty bases so they don't break __getattr__!
+    class NNTensorStubs: pass
+    class NNTargetedTensorStubs: pass
+    class NNTargetedBundleStubs: pass
 
 
 class CompilerState:
@@ -154,20 +163,37 @@ class SlicedMonad:
         raise ValueError("Use [:] to stitch the sliced monad back into the parent tensor.")
 
 
-class TargetedTensor:
+class TargetedTensor(NNTargetedTensorStubs):
     """The transient object returned when targeting axes (e.g., x.d)"""
 
     def __init__(self, tensor: 'Tensor', target_axes: Tuple[Axis, ...]):
         self.tensor = tensor
         self.target_axes = target_axes
 
-    def __getattr__(self, name: str) -> 'TargetedTensor':
+    def __getattr__(self, name: str) -> Any:
+        """Chains another target axis OR dynamically invokes an nn.py function!"""
+        # 1. Check if they are chaining an axis (e.g., x.b.s)
         for axis in self.tensor.topology:
             if axis.name == name:
                 if axis not in self.target_axes:
                     return TargetedTensor(self.tensor, self.target_axes + (axis,))
                 return self
-        raise AttributeError(f"Axis '{name}' not in tensor. Available: {[a.name for a in self.tensor.topology]}")
+
+        # Dynamic NN Library Lookup
+        # We import locally to prevent circular imports between core.py and nn.py
+        from . import nn
+        # Prevent loss functions from being dynamically chained
+        if hasattr(nn, name) and not name.endswith('_loss') and not name.endswith('_logits'):
+            func = getattr(nn, name)
+            if callable(func):
+                # We return a bound lambda that automatically routes the function into .pw()!
+                def bound_nn_method(*args, **kwargs):
+                    return self.pw(func, *args, **kwargs)
+
+                return bound_nn_method
+
+        raise AttributeError(
+            f"Axis or NN function '{name}' not found. Available axes: {[a.name for a in self.tensor.topology]}")
 
     def pw(self, func, tie: Optional[str] = None, **kwargs) -> 'Tensor':
         import jax
@@ -196,14 +222,19 @@ class TargetedTensor:
             target_axes = self.target_axes
 
         import jax, jax.numpy as jnp, numpy as np
+        from .init import _next_key
 
         in_dim = np.prod([a.size for a in self.target_axes])
         out_dim = np.prod([a.size for a in target_axes])
         if in_dim is None or out_dim is None:
             raise ValueError("Projections require axes to have statically defined sizes.")
 
-        key = jax.random.PRNGKey(42)  # In prod, this uses a proper PRNG split
-        W_raw = jax.random.normal(key, (in_dim, out_dim)) / jnp.sqrt(in_dim)
+        # Use the Tracer-Safe Key Tracker!
+        key = _next_key()
+
+        # Xavier/Glorot Normal Initialization (prevents exploding variance)
+        variance_scale = jnp.sqrt(2.0 / (in_dim + out_dim))
+        W_raw = jax.random.normal(key, (in_dim, out_dim)) * variance_scale
 
         tie_obj = Tie(tie) if tie else None
         W_param = Tensor(W_raw, Axis("_in", in_dim), Axis("_out", out_dim)).param(tie=tie_obj)
@@ -368,7 +399,7 @@ class TargetedTensor:
 
     def rename(self, new_axis: Axis) -> 'Tensor':
         """
-        Renames the targeted axis.
+        Renames the targeted axis without altering data.
         e.g., x.d2.rename(ax.d)
         """
         if len(self.target_axes) != 1:
@@ -377,15 +408,20 @@ class TargetedTensor:
         target = self.target_axes[0]
         ax_idx = self.tensor.topology.index(target)
 
-        # QoL: If the user passes an empty template like `ax.d`,
-        # automatically inherit the size from the old axis!
-        new_size = new_axis.size if new_axis.size is not None else target.size
-        final_axis = Axis(new_axis.name, new_size)
+        # STRICTNESS GUARD: Prevent silent reshaping!
+        if new_axis.size is not None and new_axis.size != target.size:
+            raise ValueError(
+                f"Topological Violation: .rename() cannot change axis sizes. "
+                f"Tried to rename '{target.name}' (size {target.size}) to "
+                f"'{new_axis.name}' (size {new_axis.size}). Use .proj() to change sizes."
+            )
+
+        # Force the new axis to strictly inherit the existing physical size
+        final_axis = Axis(new_axis.name, target.size)
 
         new_topology = list(self.tensor.topology)
         new_topology[ax_idx] = final_axis
 
-        # Return a pure Tensor with the updated topology
         return Tensor(self.tensor.unwrap(), *new_topology)
 
     def _reduce(self, jnp_func) -> 'Tensor':
@@ -483,22 +519,48 @@ class TargetedTensor:
         # TRIGGER THE MONAD!
         return SlicedMonad(self.tensor, target, key, chunk_tensor)
 
+    def __dir__(self):
+        """Exposes dynamic NN functions to dynamic autocomplete (Jupyter/REPL)."""
+        from . import nn
+        base_dir = super().__dir__()
 
-class TargetedBundle:
+        # Add all available axes
+        axes = [a.name for a in (self.tensor.topology if hasattr(self, 'tensor') else self._axes)]
+
+        # Add all public callable functions from your nn library!
+        nn_funcs = [k for k, v in vars(nn).items() if callable(v) and not k.startswith('_')]
+
+        return sorted(set(base_dir + axes + nn_funcs))
+
+
+class TargetedBundle(NNTargetedBundleStubs):
     """Handles operations targeted across multiple tensors simultaneously."""
     def __init__(self, bundle: 'Bundle', target_axes: Tuple[Axis, ...]):
         self.bundle = bundle
         self.target_axes = target_axes
 
-    def __getattr__(self, name: str) -> 'TargetedBundle':
-        # Fluent chaining for bundles
+    def __getattr__(self, name: str) -> Any:
+        """Chains another target axis OR dynamically invokes an nn.py function across the bundle!"""
+        # Check if they are chaining an axis
         for tensor in self.bundle.tensors:
             for axis in tensor.topology:
                 if axis.name == name:
                     if axis not in self.target_axes:
                         return TargetedBundle(self.bundle, self.target_axes + (axis,))
                     return self
-        raise AttributeError(f"Axis '{name}' not found in any bundled tensors.")
+
+        # Dynamic NN Library Lookup for Bundles
+        from . import nn
+        # Prevent loss functions from being dynamically chained
+        if hasattr(nn, name) and not name.endswith('_loss') and not name.endswith('_logits'):
+            func = getattr(nn, name)
+            if callable(func):
+                def bound_nn_method(*args, **kwargs):
+                    return self.pw(func, *args, **kwargs)
+
+                return bound_nn_method
+
+        raise AttributeError(f"Axis or NN function '{name}' not found in bundled tensors.")
 
     def proj(self, *target_axes: Axis, bias: bool = False, tie: Optional[str] = None) -> Tuple['Tensor', ...]:
         """Parallel Tuple Projection. Returns a tuple of projected Tensors."""
@@ -577,6 +639,48 @@ class TargetedBundle:
 
         return tuple(out_tensors)
 
+    def rename(self, new_axis: Axis) -> Tuple['Tensor', ...]:
+        """Parallel topological renaming across the bundle."""
+        results = []
+        for tensor in self.bundle.tensors:
+            # Reconstruct the targeted tensor for each item in the bundle
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            # This now inherently uses your strict size-check!
+            results.append(t_tensor.rename(new_axis))
+        return tuple(results)
+
+    def pad(self, *pad_widths: Tuple[int, int], fill: float = 0.0) -> Tuple['Tensor', ...]:
+        """Parallel topological padding across the bundle."""
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.pad(*pad_widths, fill=fill))
+        return tuple(results)
+
+    def mask(self, func, fill: float = 0.0) -> Tuple['Tensor', ...]:
+        """Parallel topological masking across the bundle."""
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.mask(func, fill=fill))
+        return tuple(results)
+
+    def __dir__(self):
+        """Exposes dynamic NN functions to dynamic autocomplete (Jupyter/REPL)."""
+        from . import nn
+        base_dir = super().__dir__()
+
+        # Collect ALL unique axes across every tensor in the bundle
+        axes = set()
+        for tensor in self.bundle.tensors:
+            for axis in tensor.topology:
+                axes.add(axis.name)
+
+        # Add all public callable functions from your nn library
+        nn_funcs = [k for k, v in vars(nn).items() if callable(v) and not k.startswith('_')]
+
+        return sorted(set(base_dir + list(axes) + nn_funcs))
+
 
 class Bundle:
     """Wraps multiple Tensors to perform parallel, fused operations."""
@@ -595,7 +699,7 @@ class Bundle:
         raise AttributeError(f"Axis '{name}' not found in bundled tensors.")
 
 
-class Tensor:
+class Tensor(NNTensorStubs):
     """The core Axiom Tensor wrapper enforcing named-axis topologies."""
 
     def __init__(self, raw_tensor: Any, *axes: Axis):
@@ -743,11 +847,46 @@ class Tensor:
 
         return result
 
-    def __getattr__(self, name: str) -> 'TargetedTensor':
+    def __getattr__(self, name: str) -> Any:
+        """Targets an axis OR dynamically invokes a purely pointwise nn function!"""
+        # 1. Axis Targeting (e.g., x.d)
         for axis in self._axes:
             if axis.name == name:
                 return TargetedTensor(self, (axis,))
-        raise AttributeError(f"Tensor has no axis '{name}'. Topology: {[a.name for a in self._axes]}")
+
+        # 2. Pure Pointwise NN Lookup
+        from . import nn
+        import inspect
+
+        # Prevent loss functions from being dynamically chained
+        if hasattr(nn, name) and not name.endswith('_loss') and not name.endswith('_logits'):
+            func = getattr(nn, name)
+            if callable(func):
+
+                # STRICTNESS GUARD: Does this function require an axis?
+                # We check the signature, or catch known custom stateful modules.
+                requires_axis = False
+                try:
+                    sig = inspect.signature(func)
+                    if 'axis' in sig.parameters:
+                        requires_axis = True
+                except ValueError:
+                    pass
+
+                if requires_axis or getattr(func, '_is_axiom_nn', False):
+                    raise ValueError(
+                        f"Mathematical Ambiguity: '{name}' requires a target axis. "
+                        f"You must target an axis first! (e.g., x.d.{name}())"
+                    )
+
+                # It's a pure pointwise function! Execute directly on the unwrapped array.
+                def bound_pointwise(*args, **kwargs):
+                    raw_res = func(self.unwrap(), *args, **kwargs)
+                    return Tensor(raw_res, *self.topology)
+
+                return bound_pointwise
+
+        raise AttributeError(f"Tensor has no axis or pure function '{name}'. Topology: {[a.name for a in self._axes]}")
 
     def __class_getitem__(cls, item: Any) -> Type:
         return cls
@@ -759,6 +898,19 @@ class Tensor:
     def __and__(self, other: 'Tensor') -> 'Bundle':
         """Allows bundling via the & operator: (x & y).d.proj()"""
         return Bundle(self, other)
+
+    def __dir__(self):
+        """Exposes dynamic NN functions to dynamic autocomplete (Jupyter/REPL)."""
+        from . import nn
+        base_dir = super().__dir__()
+
+        # Add all available axes
+        axes = [a.name for a in (self.tensor.topology if hasattr(self, 'tensor') else self._axes)]
+
+        # Add all public callable functions from your nn library!
+        nn_funcs = [k for k, v in vars(nn).items() if callable(v) and not k.startswith('_')]
+
+        return sorted(set(base_dir + axes + nn_funcs))
 
 
 def wrap(raw_tensor: Any, *axes: Axis) -> Tensor:
