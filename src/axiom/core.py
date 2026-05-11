@@ -26,8 +26,8 @@ class Axis:
         self.size = size
         self.mesh_dim: Optional[str] = None
 
-    def __call__(self, size: int) -> 'Axis':
-        new_ax = Axis(self.name, size)
+    def __call__(self, size: Any) -> 'Axis':
+        new_ax = Axis(self.name, int(size))
         new_ax.mesh_dim = self.mesh_dim
         return new_ax
 
@@ -161,7 +161,7 @@ class TargetedTensor:
         self.tensor = tensor
         self.target_axes = target_axes
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> 'TargetedTensor':
         for axis in self.tensor.topology:
             if axis.name == name:
                 if axis not in self.target_axes:
@@ -366,6 +366,28 @@ class TargetedTensor:
         padded_raw = jnp.pad(self.tensor.unwrap(), pad_width_full, constant_values=fill)
         return Tensor(padded_raw, *new_topology)
 
+    def rename(self, new_axis: Axis) -> 'Tensor':
+        """
+        Renames the targeted axis.
+        e.g., x.d2.rename(ax.d)
+        """
+        if len(self.target_axes) != 1:
+            raise ValueError("Rename requires exactly one target axis (e.g., x.d2.rename(ax.d)).")
+
+        target = self.target_axes[0]
+        ax_idx = self.tensor.topology.index(target)
+
+        # QoL: If the user passes an empty template like `ax.d`,
+        # automatically inherit the size from the old axis!
+        new_size = new_axis.size if new_axis.size is not None else target.size
+        final_axis = Axis(new_axis.name, new_size)
+
+        new_topology = list(self.tensor.topology)
+        new_topology[ax_idx] = final_axis
+
+        # Return a pure Tensor with the updated topology
+        return Tensor(self.tensor.unwrap(), *new_topology)
+
     def _reduce(self, jnp_func) -> 'Tensor':
         """Helper for reduction operations (sum, mean, max)"""
         # Find the integer indices of the targeted axes
@@ -398,6 +420,13 @@ class TargetedTensor:
         if None in sizes:
             raise ValueError("Targeted axes must have defined sizes.")
         return int(np.prod(sizes))
+
+    def __int__(self) -> int:
+        return self.size
+
+    def __index__(self) -> int:
+        """This is the method JAX looks for to cast objects to shape integers!"""
+        return self.size
 
     # --- TRANSPARENT MATH PROXIES ---
     def __mul__(self, other):
@@ -461,7 +490,7 @@ class TargetedBundle:
         self.bundle = bundle
         self.target_axes = target_axes
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> 'TargetedBundle':
         # Fluent chaining for bundles
         for tensor in self.bundle.tensors:
             for axis in tensor.topology:
@@ -557,7 +586,7 @@ class Bundle:
     def __and__(self, other: 'Tensor') -> 'Bundle':
         return Bundle(*self.tensors, other)
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> 'TargetedBundle':
         # Initialize targeting
         for tensor in self.tensors:
             for axis in tensor.topology:
@@ -694,7 +723,27 @@ class Tensor:
         return other._broadcast_op(self, operator.truediv) if isinstance(other, Tensor) else Tensor(
             operator.truediv(other, self.unwrap()), *self._axes)
 
-    def __getattr__(self, name: str):
+    def __matmul__(self, other: 'Tensor') -> 'Tensor':
+        """Topological Matrix Multiplication (Contracts all shared axes!)"""
+        if not isinstance(other, Tensor):
+            raise ValueError("Matrix multiplication requires another Tensor.")
+
+        # 1. Find all axes that exist in both tensors
+        shared_axes = [a for a in self.topology if a in other.topology]
+        if not shared_axes:
+            raise ValueError(
+                f"No shared axes to contract between {[a.name for a in self.topology]} and {[a.name for a in other.topology]}.")
+
+        # 2. Native broadcasting multiplication!
+        result = self * other
+
+        # 3. Sum over all shared axes
+        for shared_ax in shared_axes:
+            result = getattr(result, shared_ax.name).sum()
+
+        return result
+
+    def __getattr__(self, name: str) -> 'TargetedTensor':
         for axis in self._axes:
             if axis.name == name:
                 return TargetedTensor(self, (axis,))

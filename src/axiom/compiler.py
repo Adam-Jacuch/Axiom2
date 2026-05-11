@@ -2,6 +2,11 @@ import jax
 from functools import wraps
 from .core import compiler_state, Tensor
 
+from typing import Callable, Any, TypeVar, Union
+
+# Create a generic type variable for functions
+F = TypeVar('F', bound=Callable[..., Any])
+
 # Ensure the tracer routing attribute exists
 compiler_state.step_params = None
 
@@ -57,7 +62,10 @@ def axiom_jit(fn):
     return AxiomFunction(fn)
 
 
-def axiom_step(model: AxiomFunction, optimizer, mesh=None):
+def axiom_step(
+    model: Union[Callable[..., Any], Any],
+    optimizer: Any
+) -> Callable[[F], F]:
     """Compiles a training step into a pure JAX execution graph."""
     import optax
 
