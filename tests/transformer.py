@@ -41,7 +41,7 @@ def data():
     for _ in range(100):
         x = init.normal(ax.b(4), ax.s(16), ax.d(32))
         y = init.normal(ax.b(4), ax.s(16), ax.d(32))
-        yield x.d.pw(nn.softmax), y.d.pw(nn.softmax)
+        yield x.d.softmax(), y.d.softmax()
 
 for x, y in data():
     loss = step(x, y)
