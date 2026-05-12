@@ -495,6 +495,28 @@ class TargetedTensor(NNTargetedTensorStubs):
     def __rtruediv__(self, other):
         return other / self.tensor
 
+    def __matmul__(self, other: 'Tensor') -> 'Tensor':
+        """Explicit Multi-Axis Contraction (e.g., scores.sk1.sk2 @ v)"""
+        if not hasattr(other, 'topology'):
+            raise ValueError("Matrix multiplication requires another Tensor.")
+
+        # 1. Verify the targeted axes actually exist in the right tensor
+        for target_ax in self.target_axes:
+            if target_ax not in other.topology:
+                raise ValueError(
+                    f"Cannot contract over '{target_ax.name}': axis missing in right tensor. "
+                    f"Right topology: {[a.name for a in other.topology]}"
+                )
+
+        # 2. Native broadcasting multiplication (Aligns shared batches, expands the rest!)
+        result = self.tensor * other
+
+        # 3. Sum over ONLY the targeted axes
+        for target_ax in self.target_axes:
+            result = getattr(result, target_ax.name).sum()
+
+        return result
+
     def __getitem__(self, key: Any) -> Any:
         if key == slice(None): return self.tensor
         if hasattr(key, 'topology'): return RoutedContext(self.tensor, self.target_axes, key)
@@ -639,14 +661,27 @@ class TargetedBundle(NNTargetedBundleStubs):
 
         return tuple(out_tensors)
 
-    def rename(self, new_axis: Axis) -> Tuple['Tensor', ...]:
-        """Parallel topological renaming across the bundle."""
+    def rename(self, *new_axes: Axis) -> Tuple['Tensor', ...]:
+        """
+        Parallel topological renaming across the bundle.
+        e.g., (x & y).s.rename(ax.new_s) -> Both get new_s
+        e.g., (x & y).s.rename(ax.sx, ax.sy) -> x gets sx, y gets sy
+        """
+        if len(new_axes) == 1:
+            # Backward Compatibility: Broadcast 1 axis to all tensors
+            new_axes = new_axes * len(self.bundle.tensors)
+        elif len(new_axes) != len(self.bundle.tensors):
+            raise ValueError(
+                f"Bundle contains {len(self.bundle.tensors)} tensors, "
+                f"but {len(new_axes)} axes were provided to rename()."
+            )
+
         results = []
-        for tensor in self.bundle.tensors:
-            # Reconstruct the targeted tensor for each item in the bundle
+        for tensor, new_axis in zip(self.bundle.tensors, new_axes):
             t_tensor = TargetedTensor(tensor, self.target_axes)
-            # This now inherently uses your strict size-check!
+            # Reuses the strict size-checking logic inside TargetedTensor!
             results.append(t_tensor.rename(new_axis))
+
         return tuple(results)
 
     def join(self) -> 'Tensor':
@@ -869,24 +904,23 @@ class Tensor(NNTensorStubs):
             operator.truediv(other, self.unwrap()), *self._axes)
 
     def __matmul__(self, other: 'Tensor') -> 'Tensor':
-        """Topological Matrix Multiplication (Contracts all shared axes!)"""
-        if not isinstance(other, Tensor):
+        """Implicit Matrix Multiplication (Contracts the right-most shared axis)"""
+        if not hasattr(other, 'topology'):
             raise ValueError("Matrix multiplication requires another Tensor.")
 
-        # 1. Find all axes that exist in both tensors
+        # 1. Find all shared axes
         shared_axes = [a for a in self.topology if a in other.topology]
         if not shared_axes:
             raise ValueError(
-                f"No shared axes to contract between {[a.name for a in self.topology]} and {[a.name for a in other.topology]}.")
+                f"No shared axes to contract between "
+                f"{[a.name for a in self.topology]} and {[a.name for a in other.topology]}."
+            )
 
-        # 2. Native broadcasting multiplication!
-        result = self * other
+        # 2. The Implicit Rule: Pick the right-most shared axis from THIS tensor's topology
+        contract_ax = shared_axes[-1]
 
-        # 3. Sum over all shared axes
-        for shared_ax in shared_axes:
-            result = getattr(result, shared_ax.name).sum()
-
-        return result
+        # 3. Route it explicitly using our new TargetedTensor logic!
+        return TargetedTensor(self, (contract_ax,)) @ other
 
     def __getattr__(self, name: str) -> Any:
         """Targets an axis OR dynamically invokes a purely pointwise nn function!"""

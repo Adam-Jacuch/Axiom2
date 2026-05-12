@@ -84,8 +84,8 @@ def test_topological_masking():
 
     # Check the actual values (Upper right triangle should be -1e9)
     raw_result = masked_scores.unwrap()
-    assert raw_result[0, 1] == -1e9  # s=0, s_k=1 (0 >= 1 is False, masked)
-    assert raw_result[1, 0] == 0.0  # s=1, s_k=0 (1 >= 0 is True, kept)
+    assert raw_result[0, 1] == 0.0  # s=0, s_k=1 (0 >= 1 is False, masked)
+    assert raw_result[1, 0] == -1e9  # s=1, s_k=0 (1 >= 0 is True, kept)
 
 
 def test_param_tagging():

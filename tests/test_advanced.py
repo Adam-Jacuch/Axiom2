@@ -123,3 +123,87 @@ def test_true_random_init():
 
     # Because of our global PRNG key split, they should NOT be equal!
     assert not jnp.allclose(a.unwrap(), b.unwrap())
+
+
+# ==========================================
+# 1. TEST: Dynamic Pointwise & Axis Chaining
+# ==========================================
+def test_pure_pointwise():
+    print("--- Testing Pure Pointwise & Chaining ---")
+    x = init.normal(ax.b(2), ax.d(4))
+
+    # Pure tensor pointwise (no axis needed)
+    y1 = x.silu()
+
+    # Targeted pointwise
+    y2 = x.d.silu()
+
+    print(f"Base x: {x.topology}")
+    print(f"x.silu(): {y1.topology}")
+    print(f"x.d.silu(): {y2.topology}\n")
+    assert x.topology == y1.topology == y2.topology
+
+
+# ==========================================
+# 2. TEST: Multi-Axis Contraction (ViT / 2D)
+# ==========================================
+def test_multi_axis_contraction():
+    print("--- Testing Multi-Axis Contraction ---")
+    # Simulate a 2D image patch layout
+    scores = init.normal(ax.b(2), ax.h(8), ax.w(8))
+    values = init.normal(ax.b(2), ax.h(8), ax.w(8), ax.d(16))
+
+    # Contract across BOTH spatial axes simultaneously
+    out = scores.h.w @ values
+
+    print(f"Scores: {scores.topology}")
+    print(f"Values: {values.topology}")
+    print(f"scores.h.w @ values -> {out.topology}\n")
+    assert out.topology == (ax.b(2), ax.d(16))
+
+
+# ==========================================
+# 3. TEST: Bundle Renaming & Processing
+# ==========================================
+def test_bundle_operations():
+    print("--- Testing Bundle Rename & Math ---")
+    x = init.normal(ax.b(2), ax.s(4), ax.d(8))
+
+    # 1. Project into 3 distinct tensors
+    q, k, v = (x & x & x).d.proj(bias=False)
+
+    # 2. Bundle NN operations
+    q, k = (q & k).d.rms_norm()
+
+    # 3. Multi-Axis Bundle Rename!
+    k, v = (k & v).s.rename(ax.sk, ax.sv)
+
+    print(f"q: {q.topology}")
+    print(f"k: {k.topology}")
+    print(f"v: {v.topology}\n")
+
+    assert k.topology == (ax.b(2), ax.sk(4), ax.d(8))
+    assert v.topology == (ax.b(2), ax.sv(4), ax.d(8))
+
+
+# ==========================================
+# 4. TEST: Bundle Joining (Gated RNN block)
+# ==========================================
+def test_bundle_join():
+    print("--- Testing Bundle Join ---")
+    x = init.normal(ax.b(2), ax.d(16))
+    h = init.normal(ax.b(2), ax.d(16))
+
+    # Join x and h along the 'd' dimension!
+    # Expected: d(16) + d(16) -> d(32)
+    joined = (x & h).d.join()
+
+    # Project the 32-dim vector back down to 16
+    out = joined.d.proj(ax.d(16)).d.silu()
+
+    print(f"x: {x.topology}, h: {h.topology}")
+    print(f"(x & h).d.join() -> {joined.topology}")
+    print(f"Projected back -> {out.topology}\n")
+
+    assert joined.topology == (ax.b(2), ax.d(32))
+    assert out.topology == (ax.b(2), ax.d(16))
