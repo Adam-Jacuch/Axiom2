@@ -45,4 +45,4 @@ def data():
 
 for x, y in data():
     loss = step(x, y)
-    print(f"loss: {loss}") # dataset is purely random, so loss will not decrease here!
+    print(f"loss: {loss:.4f}") # dataset is purely random, so loss will not decrease here!
