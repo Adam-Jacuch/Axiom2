@@ -288,7 +288,7 @@ class TargetedTensor(NNTargetedTensorStubs):
         # 3. Align mask to the parent tensor's topology and apply
         mask_tensor = Tensor(bool_mask, *self.target_axes)
         aligned_mask = mask_tensor._align_to(self.tensor.topology)
-        result_raw = jnp.where(aligned_mask, self.tensor.unwrap(), fill)
+        result_raw = jnp.where(aligned_mask, fill, self.tensor.unwrap())
 
         return Tensor(result_raw, *self.tensor.topology)
 
