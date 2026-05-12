@@ -649,6 +649,47 @@ class TargetedBundle(NNTargetedBundleStubs):
             results.append(t_tensor.rename(new_axis))
         return tuple(results)
 
+    def join(self) -> 'Tensor':
+        """
+        Concatenates the bundled tensors along the targeted axis.
+        Returns a single Tensor. e.g., (x & y).d.join()
+        """
+        import jax.numpy as jnp
+
+        if len(self.target_axes) != 1:
+            raise ValueError("Join requires exactly one target axis (e.g., (x & y).d.join()).")
+
+        target_ax = self.target_axes[0]
+
+        # Use the first tensor as the baseline for the topological layout
+        base_tensor = self.bundle.tensors[0]
+        ax_idx = base_tensor.topology.index(target_ax)
+
+        raw_arrays = []
+        total_size = 0
+
+        for tensor in self.bundle.tensors:
+            # Extract the actual physical axis from this specific tensor
+            # (Because x might have d(32) and h might have d(64))
+            current_ax = tensor.topology[tensor.topology.index(target_ax)]
+
+            if current_ax.size is None:
+                raise ValueError(f"Cannot join on axis '{target_ax.name}' without a defined size.")
+
+            total_size += current_ax.size
+            raw_arrays.append(tensor.unwrap())
+
+        # 1. Native JAX Concatenation
+        # (JAX will automatically throw a native shape error here if the
+        # NON-targeted axes don't match, which is exactly the behavior we want!)
+        joined_raw = jnp.concatenate(raw_arrays, axis=ax_idx)
+
+        # 2. Reconstruct the topology with the newly summed dimension!
+        new_topology = list(base_tensor.topology)
+        new_topology[ax_idx] = Axis(target_ax.name, total_size)
+
+        return Tensor(joined_raw, *new_topology)
+
     def pad(self, *pad_widths: Tuple[int, int], fill: float = 0.0) -> Tuple['Tensor', ...]:
         """Parallel topological padding across the bundle."""
         results = []
