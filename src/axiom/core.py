@@ -766,6 +766,10 @@ class Bundle:
     def __and__(self, other: 'Tensor') -> 'Bundle':
         return Bundle(*self.tensors, other)
 
+    def __iter__(self):
+        """Allows direct unpacking: x, h = Bundle(x, h)"""
+        return iter(self.tensors)
+
     def __getattr__(self, name: str) -> 'TargetedBundle':
         # Initialize targeting
         for tensor in self.tensors:

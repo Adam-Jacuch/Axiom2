@@ -277,8 +277,7 @@ def test_bundle_recursion():
         return next_x & next_h
 
     # Carry both (x & h) through 10 iterations
-    final_bundle = (x & h).apply_n(rnn_step, times=10)
-    out_x, out_h = final_bundle.tensors
+    out_x, out_h = (x & h).apply_n(rnn_step, times=10)
 
     print(f"Final x: {out_x.topology}")
     print(f"Final h: {out_h.topology}\n")
