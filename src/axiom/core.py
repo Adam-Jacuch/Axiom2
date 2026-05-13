@@ -774,6 +774,62 @@ class Bundle:
                     return TargetedBundle(self, (axis,))
         raise AttributeError(f"Axis '{name}' not found in bundled tensors.")
 
+    def apply_n(self, func: callable, times: int) -> 'Bundle':
+        """
+        Recursively applies a function `times` times across bundled states using jax.lax.scan.
+        Perfect for RNNs, LSTMs, and multi-state State-Space Models.
+        """
+        import jax.lax as lax
+
+        def _scan_body(carry_raw_tuple, _):
+            # 1. Reconstruct the Axiom Tensors from the raw JAX arrays
+            carry_tensors = [
+                Tensor(raw, *orig_t.topology)
+                for raw, orig_t in zip(carry_raw_tuple, self.tensors)
+            ]
+
+            # 2. Rebuild the Bundle and apply the user's function
+            carry_bundle = Bundle(*carry_tensors)
+            out_bundle = func(carry_bundle)
+
+            # Type and structural checks
+            if not isinstance(out_bundle, Bundle):
+                raise TypeError(
+                    f"apply_n on a Bundle requires the function to return a Bundle. Got {type(out_bundle)}.")
+
+            if len(out_bundle.tensors) != len(self.tensors):
+                raise ValueError(
+                    f"Function returned {len(out_bundle.tensors)} tensors, "
+                    f"but the input bundle had {len(self.tensors)}."
+                )
+
+            # 3. Topology check for XLA stability (Input and Output topologies MUST match)
+            out_raw_tuple = []
+            for in_t, out_t in zip(self.tensors, out_bundle.tensors):
+                if in_t.topology != out_t.topology:
+                    raise ValueError(
+                        f"apply_n requires matched topologies for XLA. "
+                        f"Input tensor had {[a.name for a in in_t.topology]}, "
+                        f"but output tensor had {[a.name for a in out_t.topology]}."
+                    )
+                out_raw_tuple.append(out_t.unwrap())
+
+            # 4. Return the tuple of raw arrays for the hardware loop
+            return tuple(out_raw_tuple), None
+
+        # Extract the raw arrays to pass into lax.scan
+        init_raw_tuple = tuple(t.unwrap() for t in self.tensors)
+
+        # Execute the hardware-level loop (length=times acts as our depth)
+        final_raw_tuple, _ = lax.scan(_scan_body, init_raw_tuple, None, length=times)
+
+        # Rewrap the final output into a new Bundle
+        final_tensors = [
+            Tensor(raw, *orig_t.topology)
+            for raw, orig_t in zip(final_raw_tuple, self.tensors)
+        ]
+        return Bundle(*final_tensors)
+
 
 class Tensor(NNTensorStubs):
     """The core Axiom Tensor wrapper enforcing named-axis topologies."""
@@ -829,6 +885,37 @@ class Tensor(NNTensorStubs):
         """
         raw_result = func(self.unwrap(), **kwargs)
         return Tensor(raw_result, *self._axes)
+
+    def apply_n(self, func: callable, times: int) -> 'Tensor':
+        """
+        Recursively applies a function `times` times using jax.lax.scan.
+        Guarantees O(1) compilation time and strictly tied hardware weights.
+        """
+        import jax.lax as lax
+
+        def _scan_body(carry_raw, _):
+            # 1. Reconstruct the Axiom Tensor for the user's function
+            carry_tensor = Tensor(carry_raw, *self.topology)
+
+            # 2. Apply the block function
+            out_tensor = func(carry_tensor)
+
+            # 3. XLA scan requires the carry to remain identical in shape/dtype
+            if out_tensor.topology != carry_tensor.topology:
+                raise ValueError(
+                    f"apply_n requires the function to return the same topology. "
+                    f"Input was {[a.name for a in carry_tensor.topology]}, "
+                    f"but function returned {[a.name for a in out_tensor.topology]}."
+                )
+
+            # 4. Unwrap back to a raw JAX array for the hardware loop
+            return out_tensor.unwrap(), None
+
+        # Execute the hardware-level loop (length=times acts as our depth)
+        final_raw, _ = lax.scan(_scan_body, self.unwrap(), None, length=times)
+
+        # Rewrap the final output
+        return Tensor(final_raw, *self.topology)
 
     # ==========================================
     # UNION-BASED TOPOLOGY ENGINE

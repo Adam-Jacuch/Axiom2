@@ -1,7 +1,7 @@
 import pytest
 import jax
 import jax.numpy as jnp
-from axiom import ax, Tensor, wrap, nn, init
+from axiom import ax, Tensor, Bundle, wrap, nn, init
 from axiom.core import SlicedMonad
 
 
@@ -207,3 +207,81 @@ def test_bundle_join():
 
     assert joined.topology == (ax.b(2), ax.d(32))
     assert out.topology == (ax.b(2), ax.d(16))
+
+
+def test_multiaxis_contraction():
+    print("--- Testing Multi-Axis Contraction (3D Attention) ---")
+    # b: batch, s: sequence, sk1: spatial 1, sk2: spatial 2, d: feature
+    q = init.normal(ax.b(2), ax.s(4), ax.d(8))
+    k1 = init.normal(ax.b(2), ax.sk1(4), ax.d(8))
+    k2 = init.normal(ax.b(2), ax.sk2(4), ax.d(8))
+    v = init.normal(ax.b(2), ax.sk1(4), ax.sk2(4), ax.d(8))
+
+    # 1. Compute bilinear scores: (q @ k1) * (q @ k2)
+    # q @ k1 -> [b, s, sk1]
+    # q @ k2 -> [b, s, sk2]
+    # Result -> [b, s, sk1, sk2]
+    scores = (q @ k1) * (q @ k2)
+
+    print(f"Scores Topology: {scores.topology}")
+    assert scores.topology == (ax.b(2), ax.s(4), ax.sk1(4), ax.sk2(4))
+
+    # 2. Multi-axis contraction: scores.sk1.sk2 @ v
+    # This should contract sk1 and sk2 simultaneously!
+    # [b, s, sk1, sk2] @ [b, sk1, sk2, d] -> [b, s, d]
+    out = scores.sk1.sk2 @ v
+
+    print(f"Output Topology: {out.topology}\n")
+    assert out.topology == (ax.b(2), ax.s(4), ax.d(8))
+
+
+def test_tensor_recursion():
+    print("--- Testing Tensor.apply_n (Weight-Tied Depth) ---")
+    x = init.normal(ax.b(2), ax.s(4), ax.d(16))
+
+    def weight_tied_block(carry: Tensor) -> Tensor:
+        # A simple projection tied across all iterations
+        return (carry + carry.d.proj().d.silu()).d.rms_norm()
+
+    # Apply the block 8 times recursively
+    # In XLA, this is a single 'scan' loop
+    final_x = x.apply_n(weight_tied_block, times=8)
+
+    print(f"Input: {x.topology}")
+    print(f"Output after 8 recursive steps: {final_x.topology}\n")
+
+    assert final_x.topology == x.topology
+
+
+def test_bundle_recursion():
+    print("--- Testing Bundle.apply_n (SSM / RNN State) ---")
+    x = init.normal(ax.b(2), ax.d(16))
+    h = init.zeros(ax.b(2), ax.h(32))  # Hidden state
+
+    def rnn_step(states: Bundle) -> Bundle:
+        curr_x, curr_h = states.tensors
+
+        # 1. Update hidden state: h = tanh(Wx + Uh)
+        # We explicitly rename 'h' to 'd' to align their spatial dimensions!
+        curr_h_aligned = curr_h.h.rename(ax.d(32))
+
+        # Now the single-axis join cleanly stacks them along 'd'
+        joined = (curr_x & curr_h_aligned).d.join()
+
+        # Project the joined 48-dim 'd' vector back into a 32-dim 'h' vector
+        next_h = joined.d.proj(ax.h(32)).h.tanh()
+
+        # 2. Update x: x = x + proj(h)
+        next_x = curr_x + next_h.h.proj(ax.d(16))
+
+        return next_x & next_h
+
+    # Carry both (x & h) through 10 iterations
+    final_bundle = (x & h).apply_n(rnn_step, times=10)
+    out_x, out_h = final_bundle.tensors
+
+    print(f"Final x: {out_x.topology}")
+    print(f"Final h: {out_h.topology}\n")
+
+    assert out_x.topology == (ax.b(2), ax.d(16))
+    assert out_h.topology == (ax.b(2), ax.h(32))
