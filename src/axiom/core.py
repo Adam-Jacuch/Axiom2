@@ -115,6 +115,16 @@ class SlicedMonad:
         new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).proj(*target_axes, bias=bias, tie=tie)
         return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
 
+    def bias(self, init=None, tie: Optional[str] = None) -> 'SlicedMonad':
+        """Adds a learnable bias to the sliced chunk and keeps the monad alive."""
+        new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).bias(init=init, tie=tie)
+        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
+
+    def gate(self, init=None, tie: Optional[str] = None) -> 'SlicedMonad':
+        """Multiplies the sliced chunk by a learnable gate and keeps the monad alive."""
+        new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).gate(init=init, tie=tie)
+        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
+
     def __mul__(self, other):
         """SwiGLU Magic: Cross-tensor math drops the stitch and returns pure Tensors!"""
         if hasattr(other, 'chunk_tensor'):
@@ -217,58 +227,82 @@ class TargetedTensor(NNTargetedTensorStubs):
         raw_result = func(self.tensor.unwrap(), **kwargs)
         return Tensor(raw_result, *self.tensor.topology)
 
-    def proj(self, *target_axes: Axis, bias: bool = False, tie: Optional[str] = None) -> 'Tensor':
+    def proj(self, *target_axes: 'Axis', bias: bool = False, tie: Optional[str] = None, init=None) -> 'Tensor':
         if not target_axes:
             target_axes = self.target_axes
 
-        import jax, jax.numpy as jnp, numpy as np
-        from .init import _next_key
+        import jax.numpy as jnp, numpy as np
+        from .state import state
+        from . import init as ax_init
 
         in_dim = np.prod([a.size for a in self.target_axes])
         out_dim = np.prod([a.size for a in target_axes])
         if in_dim is None or out_dim is None:
             raise ValueError("Projections require axes to have statically defined sizes.")
 
-        # Use the Tracer-Safe Key Tracker!
-        key = _next_key()
+        # Default to Xavier if no init is provided
+        initializer = init if init is not None else ax_init.xavier
 
-        # Xavier/Glorot Normal Initialization (prevents exploding variance)
-        variance_scale = jnp.sqrt(2.0 / (in_dim + out_dim))
-        W_raw = jax.random.normal(key, (in_dim, out_dim)) * variance_scale
+        # Get/Init the Weight Matrix via the State Manager
+        W_raw = state.get_param(
+            layer_type="proj_w",
+            shape=(in_dim, out_dim),
+            init_fn=initializer,
+            tie=tie,
+            fan_in=in_dim,
+            fan_out=out_dim
+        )
+        W_param = Tensor(W_raw, Axis("_in", in_dim), Axis("_out", out_dim))
 
-        tie_obj = Tie(tie) if tie else None
-        W_param = Tensor(W_raw, Axis("_in", in_dim), Axis("_out", out_dim)).param(tie=tie_obj)
-
-        # --- THE FIX: Topologically-Aware Flattening ---
-        # 1. Identify which axes we are keeping vs targeting
+        # --- Topologically-Aware Flattening (Your existing flawless logic) ---
         kept_axes = tuple(a for a in self.tensor.topology if a not in self.target_axes)
-
-        # 2. Transpose the targeted axes to the very end of the array
         transpose_order = [self.tensor.topology.index(a) for a in kept_axes + self.target_axes]
         transposed_raw = jnp.transpose(self.tensor.unwrap(), transpose_order)
 
-        # 3. Flatten all the targeted axes into a single 'in_dim' dimension
         kept_shape = tuple(a.size if a.size is not None else -1 for a in kept_axes)
         flattened_raw = jnp.reshape(transposed_raw, kept_shape + (in_dim,))
 
-        # 4. Safely perform the matrix multiplication!
         result_raw = jnp.dot(flattened_raw, W_param.unwrap())
 
-        # 5. Reconstruct the new topology and shape
         new_topology = kept_axes + target_axes
         new_shape = tuple(a.size if a.size is not None else -1 for a in new_topology)
-
         result_raw = jnp.reshape(result_raw, new_shape)
         result_tensor = Tensor(result_raw, *new_topology)
 
         # --- BIAS LOGIC ---
         if bias:
-            b_raw = jnp.zeros(out_dim)
-            b_tie = Tie(f"{tie}_bias") if tie else None
-            b_param = Tensor(b_raw, *target_axes).param(tie=b_tie)
-            return result_tensor + b_param  # Native broadcasting handles alignment!
+            # We explicitly use zeros here, but we target the new output axes
+            return result_tensor.target(*target_axes).bias(tie=f"{tie}_bias" if tie else None)
 
         return result_tensor
+
+    def bias(self, init=None, tie: Optional[str] = None) -> 'Tensor':
+        """Adds a learnable bias parameter matching the targeted axes."""
+        from .state import state
+        from . import init as ax_init
+
+        initializer = init if init is not None else ax_init.zeros
+        shape = tuple(a.size for a in self.target_axes)
+
+        b_raw = state.get_param("bias", shape, initializer, tie=tie)
+        b_tensor = Tensor(b_raw, *self.target_axes)
+
+        # Native Axiom addition will automatically broadcast over the untargeted axes!
+        return self.tensor + b_tensor
+
+    def gate(self, init=None, tie: Optional[str] = None) -> 'Tensor':
+        """Multiplies the tensor by a learnable scaling parameter matching the targeted axes."""
+        from .state import state
+        from . import init as ax_init
+
+        initializer = init if init is not None else ax_init.ones
+        shape = tuple(a.size for a in self.target_axes)
+
+        g_raw = state.get_param("gate", shape, initializer, tie=tie)
+        g_tensor = Tensor(g_raw, *self.target_axes)
+
+        # Native Axiom multiplication automatically broadcasts
+        return self.tensor * g_tensor
 
     def mask(self, func, fill: float) -> 'Tensor':
         """Native coordinate-based masking."""
@@ -531,6 +565,14 @@ class TargetedTensor(NNTargetedTensorStubs):
         full_slice[ax_idx] = key
         sliced_raw = self.tensor.unwrap()[tuple(full_slice)]
 
+        if isinstance(key, int):
+            # Integer indexing physically removes the dimension from the array.
+            new_topology = list(self.tensor.topology)
+            new_topology.pop(ax_idx)  # Drop the axis entirely!
+
+            # Return a pure Tensor (no Monad needed since it's a reduction)
+            return Tensor(sliced_raw, *new_topology)
+
         new_size = sliced_raw.shape[ax_idx]
         new_axis = Axis(target.name, new_size)
 
@@ -584,16 +626,29 @@ class TargetedBundle(NNTargetedBundleStubs):
 
         raise AttributeError(f"Axis or NN function '{name}' not found in bundled tensors.")
 
-    def proj(self, *target_axes: Axis, bias: bool = False, tie: Optional[str] = None) -> Tuple['Tensor', ...]:
-        """Parallel Tuple Projection. Returns a tuple of projected Tensors."""
-        # For eager execution, we simply map the projection across the bundle.
-        # (Later, @axiom_jit will fuse this into a block-matrix mult!)
+    def proj(self, *target_axes: 'Axis', bias: bool = False, tie: Optional[str] = None, init=None) -> 'Bundle':
+        """Parallel Bundle Projection. Returns a chainable Bundle."""
         results = []
         for tensor in self.bundle.tensors:
-            # Reconstruct a targeted tensor and call proj
             t_tensor = TargetedTensor(tensor, self.target_axes)
-            results.append(t_tensor.proj(*target_axes, bias=bias, tie=tie))
-        return tuple(results)
+            results.append(t_tensor.proj(*target_axes, bias=bias, tie=tie, init=init))
+        return Bundle(*results)  # Return a Bundle for infinite chaining!
+
+    def bias(self, init=None, tie: Optional[str] = None) -> 'Bundle':
+        """Parallel Bias Application. Returns a chainable Bundle."""
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.bias(init=init, tie=tie))
+        return Bundle(*results)
+
+    def gate(self, init=None, tie: Optional[str] = None) -> 'Bundle':
+        """Parallel Gate Application. Returns a chainable Bundle."""
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.gate(init=init, tie=tie))
+        return Bundle(*results)
 
     def pw(self, func, tie: Optional[str] = None, **kwargs) -> Tuple['Tensor', ...]:
         """Parallel Pointwise Mapping."""

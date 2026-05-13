@@ -284,3 +284,86 @@ def test_bundle_recursion():
 
     assert out_x.topology == (ax.b(2), ax.d(16))
     assert out_h.topology == (ax.b(2), ax.h(32))
+
+
+import jax.numpy as jnp
+from axiom.core import Tensor, ax
+from axiom.state import state
+import axiom.init as ax_init
+
+
+# ==========================================
+# 8. TEST: Initializer DSL Math
+# ==========================================
+def test_initializer_math():
+    print("--- Testing Initializer DSL Math ---")
+    state.params.clear()  # Reset state
+
+    # 1. Multiply an initializer by a scalar
+    custom_init = ax_init.ones * 5.0
+
+    # 2. Use it directly to generate a tensor
+    t = custom_init(ax.d(4))
+
+    print(f"Generated Tensor: {t.unwrap()}")
+    assert jnp.allclose(t.unwrap(), 5.0)
+    print("Initializer Math works flawlessly!\n")
+
+
+# ==========================================
+# 9. TEST: Implicit Learnable Parameters (.bias / .gate)
+# ==========================================
+def test_implicit_parameters():
+    print("--- Testing .bias() and .gate() with Invisible Scope ---")
+    state.params.clear()
+    state.counters.clear()
+
+    x = Tensor(jnp.ones((2, 16)), ax.b(2), ax.d(16))
+
+    def gated_residual_block(t):
+        # Multiply by 0.5, then add 2.0
+        # Expected output: (1.0 * 0.5) + 2.0 = 2.5
+        t = t.d.gate(init=ax_init.ones * 0.5)
+        t = t.d.bias(init=ax_init.ones * 2.0)
+        return t
+
+    out = gated_residual_block(x)
+
+    print(f"Output shape: {out.topology}")
+    print(f"Output values (expected 2.5): {out.unwrap()[0, 0]}")
+
+    assert jnp.allclose(out.unwrap(), 2.5)
+
+    # Verify the Invisible State Manager auto-named them correctly!
+    print(f"State Manager Params: {list(state.params.keys())}")
+    assert "gated_residual_block/gate_1" in state.params
+    assert "gated_residual_block/bias_1" in state.params
+    print("Implicit parameters and Invisible Scope passed!\n")
+
+
+# ==========================================
+# 10. TEST: Bundle Parallel Tying
+# ==========================================
+def test_bundle_tied_gates():
+    print("--- Testing Bundle .gate() and .bias() with Global Tying ---")
+    state.params.clear()
+
+    x = Tensor(jnp.ones((2, 16)), ax.b(2), ax.d(16))
+    h = Tensor(jnp.ones((2, 16)), ax.b(2), ax.d(16))
+
+    # Apply a globally tied gate and bias to BOTH tensors simultaneously
+    # x and h will share the exact same hardware parameters!
+    out_x, out_h = (x & h).d.gate(tie="@shared_gate", init=ax_init.ones * 2.0) \
+        .d.bias(tie="@shared_bias", init=ax_init.ones * 3.0)
+
+    # (1.0 * 2.0) + 3.0 = 5.0
+    assert jnp.allclose(out_x.unwrap(), 5.0)
+    assert jnp.allclose(out_h.unwrap(), 5.0)
+
+    # The state manager should only have ONE copy of each parameter,
+    # not two, because they were tied via the @ symbol!
+    print(f"State Manager Params: {list(state.params.keys())}")
+    assert "shared_gate" in state.params
+    assert "shared_bias" in state.params
+    assert len(state.params) == 2
+    print("Bundle parallel gating passed!\n")
