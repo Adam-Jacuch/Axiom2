@@ -367,3 +367,24 @@ def test_bundle_tied_gates():
     assert "shared_bias" in state.params
     assert len(state.params) == 2
     print("Bundle parallel gating passed!\n")
+
+
+def test_scalar_indexing():
+    print("--- Testing Scalar Indexing ---")
+    # b=2, d=10
+    x = init.normal(ax.b(2), ax.d(10))
+
+    first = x.d[0]
+    last = x.d[-1]
+    middle = x.d[x.d // 2]
+
+    print(f"Original: {x.topology}")
+    print(f"First  x.d[0]       -> {first.topology}")
+    print(f"Last   x.d[-1]      -> {last.topology}")
+    print(f"Middle x.d[x.d//2]  -> {middle.topology}")
+
+    # Assert the 'd' axis was physically removed
+    assert first.topology == (ax.b(2),)
+    assert last.topology == (ax.b(2),)
+    assert middle.topology == (ax.b(2),)
+    print("Scalar indexing passed!\n")
