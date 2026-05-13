@@ -658,6 +658,14 @@ class TargetedBundle(NNTargetedBundleStubs):
             results.append(t_tensor.pw(func, tie=tie, **kwargs))
         return tuple(results)
 
+    def unfold(self, window_axis: 'Axis', step: int = 1) -> 'Bundle':
+        """Parallel topological unfolding across the bundle. Returns a chainable Bundle."""
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.unfold(window_axis, step=step))
+        return Bundle(*results)
+
     def assoc_scan(self, func) -> Tuple['Tensor', ...]:
         """Parallel associative scan over the bundled tensors."""
         import jax
