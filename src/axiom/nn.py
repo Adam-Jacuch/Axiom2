@@ -90,21 +90,67 @@ def bce_with_logits(logits: Tensor, targets: Tensor) -> Tensor:
 
 def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor) -> Tensor:
     """
-    Categorical Cross Entropy Loss.
-    Requires a TargetedTensor to specify the class/vocab axis!
-    Usage: loss = nn.cross_entropy_loss(logits.vocab, targets_one_hot)
+    Cross entropy over a targeted class axis.
+
+    Sparse usage:
+        logits:  Tensor with class axis, e.g. (s, v)
+        call:    nn.cross_entropy_loss(logits.v, targets)
+        targets: integer Tensor without class axis, e.g. (s)
+        returns: Tensor without class axis, e.g. (s)
+
+    Dense usage:
+        logits:  Tensor with class axis, e.g. (s, v)
+        call:    nn.cross_entropy_loss(logits.v, targets)
+        targets: one-hot/probability Tensor with class axis, e.g. (s, v)
+        returns: Tensor without class axis, e.g. (s)
     """
-    # 1. log_softmax automatically scopes to the targeted axis!
-    log_probs = logits.pw(jax.nn.log_softmax)
+    import jax
+    import jax.numpy as jnp
+    from .core import TargetedTensor, Tensor
 
-    # 2. Multiply by the target distribution
-    loss_tensor = -(targets * log_probs)
+    if not isinstance(logits, TargetedTensor):
+        raise ValueError(
+            "cross_entropy_loss expects targeted logits, e.g. "
+            "nn.cross_entropy_loss(out.v, targets), not nn.cross_entropy_loss(out, targets)."
+        )
 
-    # 3. Sum over the targeted class axis to get the scalar loss per token/batch
-    for a in logits.target_axes:
-        loss_tensor = getattr(loss_tensor, a.name).sum()
+    if len(logits.target_axes) != 1:
+        raise ValueError(
+            "cross_entropy_loss expects exactly one targeted class axis, "
+            f"got {[a.name for a in logits.target_axes]}."
+        )
 
-    return loss_tensor
+    x = logits.tensor
+    class_ax = logits.target_axes[0]
+
+    if class_ax not in x.topology:
+        raise ValueError(
+            f"Class axis '{class_ax.name}' is not present in logits topology "
+            f"{[a.name for a in x.topology]}."
+        )
+
+    class_idx = x.topology.index(class_ax)
+    log_probs_raw = jax.nn.log_softmax(x.unwrap(), axis=class_idx)
+
+    # Topology after removing the class axis.
+    out_topology = tuple(a for a in x.topology if a != class_ax)
+
+    # Dense / one-hot case: targets include the class axis.
+    if class_ax in targets.topology:
+        target_raw = targets._align_to(x.topology)
+        loss_raw = -(target_raw * log_probs_raw).sum(axis=class_idx)
+        return Tensor(loss_raw, *out_topology)
+
+    # Sparse integer-label case: targets do NOT include the class axis.
+    target_raw = targets._align_to(out_topology).astype(jnp.int32)
+
+    # Insert singleton class dimension so take_along_axis can gather along class_idx.
+    gather_idx = jnp.expand_dims(target_raw, axis=class_idx)
+
+    loss_raw = -jnp.take_along_axis(log_probs_raw, gather_idx, axis=class_idx)
+    loss_raw = jnp.squeeze(loss_raw, axis=class_idx)
+
+    return Tensor(loss_raw, *out_topology)
 
 
 # ==========================================

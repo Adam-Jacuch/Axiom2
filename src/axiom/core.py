@@ -97,80 +97,519 @@ class Tie:
 
 
 class SlicedMonad:
-    """The Unslice Monad. Tracks sliced chunks and stitches them back together via [:]"""
+    """
+    Lazy slice / optional patch transaction.
 
-    def __init__(self, original_tensor, target_ax, slice_obj, chunk_tensor):
+    Semantics:
+      - If consumed as a value, it behaves like its chunk_tensor.
+      - If closed with [:], it commits the chunk back into the original tensor.
+      - Patch commits are only allowed for patch-safe, topology-preserving transforms.
+    """
+
+    def __init__(
+        self,
+        original_tensor,
+        target_ax,
+        slice_obj,
+        chunk_tensor,
+        expected_topology=None,
+        patch_safe: bool = True,
+        unsafe_reason: Optional[str] = None,
+    ):
         self.original_tensor = original_tensor
         self.target_ax = target_ax
         self.slice_obj = slice_obj
         self.chunk_tensor = chunk_tensor
+        self.expected_topology = tuple(expected_topology or chunk_tensor.topology)
+        self.patch_safe = patch_safe
+        self.unsafe_reason = unsafe_reason
+
+    # -------------------------
+    # Tensor-like value decay
+    # -------------------------
+
+    def _as_tensor(self):
+        return self.chunk_tensor
+
+    def unwrap(self):
+        return self.chunk_tensor.unwrap()
+
+    @property
+    def topology(self):
+        return self.chunk_tensor.topology
+
+    def _topology_signature(self, topology):
+        # Axis.__eq__ currently compares only by name, so strict commit checks
+        # must compare both name and size explicitly.
+        return tuple((a.name, a.size) for a in topology)
+
+    def _current_target_ax(self):
+        """
+        Finds the current chunk axis corresponding to the original patched axis.
+        This avoids using a stale Axis object from the parent tensor.
+        """
+        for a in self.chunk_tensor.topology:
+            if a.name == self.target_ax.name:
+                return a
+
+        raise ValueError(
+            f"Cannot target original patch axis '{self.target_ax.name}' because "
+            f"it is no longer present in the sliced chunk topology: "
+            f"{[repr(a) for a in self.chunk_tensor.topology]}"
+        )
+
+    def _wrap(
+        self,
+        result,
+        *,
+        patch_safe: Optional[bool] = None,
+        unsafe_reason: Optional[str] = None,
+    ):
+        """
+        Re-wrap Tensor results into the same pending patch transaction.
+        Non-Tensor results are returned as-is.
+        """
+        if hasattr(result, "chunk_tensor"):
+            result = result.chunk_tensor
+
+        if not isinstance(result, Tensor):
+            return result
+
+        if patch_safe is None:
+            patch_safe = self.patch_safe
+
+        if unsafe_reason is None:
+            unsafe_reason = self.unsafe_reason
+
+        return SlicedMonad(
+            self.original_tensor,
+            self.target_ax,
+            self.slice_obj,
+            result,
+            expected_topology=self.expected_topology,
+            patch_safe=patch_safe,
+            unsafe_reason=unsafe_reason,
+        )
+
+    def _unsafe(self, reason: str):
+        return SlicedMonad(
+            self.original_tensor,
+            self.target_ax,
+            self.slice_obj,
+            self.chunk_tensor,
+            expected_topology=self.expected_topology,
+            patch_safe=False,
+            unsafe_reason=reason,
+        )
+
+    # -------------------------
+    # Common direct ops
+    # -------------------------
 
     def pw(self, func, **kwargs) -> 'SlicedMonad':
-        """Applies a pointwise function to the chunk and keeps the monad alive."""
-        new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).pw(func, **kwargs)
-        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
+        target = self._current_target_ax()
+        new_chunk = TargetedTensor(self.chunk_tensor, (target,)).pw(func, **kwargs)
+        return self._wrap(new_chunk)
 
-    def proj(self, *target_axes, bias: bool = False, tie: Optional[str] = None) -> 'SlicedMonad':
-        """Projects the chunk and keeps the monad alive."""
-        new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).proj(*target_axes, bias=bias, tie=tie)
-        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
+    def proj(self, *target_axes, bias: bool = False, tie: Optional[str] = None, init=None) -> 'SlicedMonad':
+        """
+        Patch-safe only for proj() with no explicit target axes.
+
+        Legal:
+            x.d[half:].proj()[:]
+
+        Illegal as patch:
+            x.d[half:].proj(ax.d2(128))[:]
+            x.d[half:].proj(ax.d(128))[:]
+
+        Explicit projection is still usable as a value; it just cannot be committed
+        through the monad.
+        """
+        target = self._current_target_ax()
+
+        explicit_projection = len(target_axes) > 0
+        new_chunk = TargetedTensor(self.chunk_tensor, (target,)).proj(
+            *target_axes,
+            bias=bias,
+            tie=tie,
+            init=init,
+        )
+
+        if explicit_projection:
+            return self._wrap(
+                new_chunk,
+                patch_safe=False,
+                unsafe_reason=(
+                    "Explicit proj(...) inside a sliced patch is not commit-safe. "
+                    "Use proj() with no explicit axes for same-axis patch projection, "
+                    "or stitch manually."
+                ),
+            )
+
+        return self._wrap(new_chunk)
 
     def bias(self, init=None, tie: Optional[str] = None) -> 'SlicedMonad':
-        """Adds a learnable bias to the sliced chunk and keeps the monad alive."""
-        new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).bias(init=init, tie=tie)
-        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
+        target = self._current_target_ax()
+        new_chunk = TargetedTensor(self.chunk_tensor, (target,)).bias(init=init, tie=tie)
+        return self._wrap(new_chunk)
 
     def gate(self, init=None, tie: Optional[str] = None) -> 'SlicedMonad':
-        """Multiplies the sliced chunk by a learnable gate and keeps the monad alive."""
-        new_chunk = TargetedTensor(self.chunk_tensor, (self.target_ax,)).gate(init=init, tie=tie)
-        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, new_chunk)
+        target = self._current_target_ax()
+        new_chunk = TargetedTensor(self.chunk_tensor, (target,)).gate(init=init, tie=tie)
+        return self._wrap(new_chunk)
+
+    # -------------------------
+    # Attribute / axis routing
+    # -------------------------
+
+    def __getattr__(self, name):
+        # Axis targeting should preserve patch context.
+        for axis in self.chunk_tensor.topology:
+            if axis.name == name:
+                return TargetedSlicedMonad(self, (axis,))
+
+        attr = getattr(self.chunk_tensor, name)
+
+        if callable(attr):
+            def wrapped(*args, **kwargs):
+                return self._wrap(attr(*args, **kwargs))
+            return wrapped
+
+        return attr
+
+    # -------------------------
+    # Arithmetic
+    # -------------------------
+
+    def _is_monad_like(self, x):
+        return hasattr(x, "chunk_tensor")
+
+    def _unwrap_other(self, other):
+        if hasattr(other, "chunk_tensor"):
+            return other.chunk_tensor
+        if hasattr(other, "tensor") and hasattr(other, "target_axes"):
+            return other.tensor
+        return other
+
+    def _binary_value_or_patch(self, other, op):
+        """
+        Arithmetic policy:
+
+          - monad op monad:
+              dissolve to a pure Tensor, because there are now two competing
+              patch origins and no unambiguous commit target.
+
+          - monad op scalar/plain Tensor:
+              preserve the patch context, because this is a simple transform
+              of one sliced region.
+        """
+        other_is_monad = self._is_monad_like(other)
+        other_unwrapped = self._unwrap_other(other)
+        result = op(self.chunk_tensor, other_unwrapped)
+
+        if other_is_monad:
+            return result
+
+        return self._wrap(result)
+
+    def _rbinary_value_or_patch(self, other, op):
+        other_is_monad = self._is_monad_like(other)
+        other_unwrapped = self._unwrap_other(other)
+        result = op(other_unwrapped, self.chunk_tensor)
+
+        if other_is_monad:
+            return result
+
+        return self._wrap(result)
+
+    def __add__(self, other):
+        import operator
+        return self._binary_value_or_patch(other, operator.add)
+
+    def __radd__(self, other):
+        import operator
+        return self._rbinary_value_or_patch(other, operator.add)
+
+    def __sub__(self, other):
+        import operator
+        return self._binary_value_or_patch(other, operator.sub)
+
+    def __rsub__(self, other):
+        import operator
+        return self._rbinary_value_or_patch(other, operator.sub)
 
     def __mul__(self, other):
-        """SwiGLU Magic: Cross-tensor math drops the stitch and returns pure Tensors!"""
-        if hasattr(other, 'chunk_tensor'):
-            other = other.chunk_tensor
-        elif hasattr(other, 'tensor'):
-            other = other.tensor
+        import operator
+        return self._binary_value_or_patch(other, operator.mul)
 
-        if isinstance(other, Tensor):
-            return self.chunk_tensor * other
-        return SlicedMonad(self.original_tensor, self.target_ax, self.slice_obj, self.chunk_tensor * other)
+    def __rmul__(self, other):
+        import operator
+        return self._rbinary_value_or_patch(other, operator.mul)
+
+    def __truediv__(self, other):
+        import operator
+        return self._binary_value_or_patch(other, operator.truediv)
+
+    def __rtruediv__(self, other):
+        import operator
+        return self._rbinary_value_or_patch(other, operator.truediv)
+
+    def __neg__(self):
+        return self._wrap(-self.chunk_tensor)
+
+    def __matmul__(self, other):
+        # Matmul is value-style by default. It should not preserve patch context.
+        return self.chunk_tensor @ self._unwrap_other(other)
+
+    def __and__(self, other):
+        # Bundling is value-style by default. It should not preserve patch context.
+        return self.chunk_tensor & self._unwrap_other(other)
+
+    # -------------------------
+    # Commit
+    # -------------------------
 
     def __getitem__(self, key) -> 'Tensor':
-        """The Unslice Closer [:] - Concatenates the chunk back into the original topology!"""
-        if key == slice(None):
-            import jax.numpy as jnp
-            orig_raw = self.original_tensor.unwrap()
-            ax_idx = self.original_tensor.topology.index(self.target_ax)
+        """
+        The Unslice Closer [:].
 
-            # Resolve slice bounds
-            start = self.slice_obj.start or 0
-            stop = self.slice_obj.stop or orig_raw.shape[ax_idx]
+        Commits only if:
+          1. the operation was patch-safe
+          2. the transformed chunk has exactly the original sliced topology
+        """
+        if key != slice(None):
+            raise ValueError("Use [:] to stitch the sliced monad back into the parent tensor.")
 
-            # Slice out the untouched left and right segments
-            left_slice = [slice(None)] * orig_raw.ndim
-            left_slice[ax_idx] = slice(None, start)
+        import jax.numpy as jnp
 
-            right_slice = [slice(None)] * orig_raw.ndim
-            right_slice[ax_idx] = slice(stop, None)
+        if not self.patch_safe:
+            raise ValueError(
+                "Cannot commit sliced patch because this slice went through an unsafe operation. "
+                f"{self.unsafe_reason or ''}"
+            )
 
-            left_raw = orig_raw[tuple(left_slice)]
-            right_raw = orig_raw[tuple(right_slice)]
+        expected_sig = self._topology_signature(self.expected_topology)
+        actual_sig = self._topology_signature(self.chunk_tensor.topology)
 
-            # Stitch the modified chunk back into the middle!
-            stitched_raw = jnp.concatenate([left_raw, self.chunk_tensor.unwrap(), right_raw], axis=ax_idx)
+        if actual_sig != expected_sig:
+            raise ValueError(
+                "Cannot commit sliced patch because the chunk topology changed. "
+                f"Expected {expected_sig}, got {actual_sig}. "
+                "Sliced patch commits only support topology-preserving transforms. "
+                "For projections, reshapes, renames, unfolds, reductions, or other topology-changing "
+                "operations, stitch manually."
+            )
 
-            # Compute the new global topology (handles if the chunk was projected to a new size/name)
-            chunk_ax = self.chunk_tensor.topology[ax_idx]
-            new_size = left_raw.shape[ax_idx] + chunk_ax.size + right_raw.shape[ax_idx]
-            new_axis = Axis(chunk_ax.name, new_size)
+        orig_raw = self.original_tensor.unwrap()
+        chunk_raw = self.chunk_tensor.unwrap()
+        ax_idx = self.original_tensor.topology.index(self.target_ax)
 
-            new_top = list(self.original_tensor.topology)
-            new_top[ax_idx] = new_axis
+        # This monad currently supports simple static Python slices.
+        if not isinstance(self.slice_obj, slice):
+            raise ValueError(
+                "Sliced patch commit currently only supports Python slice objects. "
+                f"Got {type(self.slice_obj)}."
+            )
 
-            return Tensor(stitched_raw, *new_top)
+        if self.slice_obj.step not in (None, 1):
+            raise ValueError(
+                "Sliced patch commit currently only supports contiguous slices with step None or 1. "
+                f"Got step={self.slice_obj.step}."
+            )
 
-        raise ValueError("Use [:] to stitch the sliced monad back into the parent tensor.")
+        axis_size = orig_raw.shape[ax_idx]
+
+        # Normalize Python slice semantics, including negative bounds.
+        start, stop, step = self.slice_obj.indices(axis_size)
+
+        if step != 1:
+            raise ValueError(
+                "Sliced patch commit currently only supports contiguous forward slices with step 1. "
+                f"Got normalized step={step}."
+            )
+
+        if start > stop:
+            raise ValueError(
+                f"Invalid patch slice bounds after normalization: start={start}, stop={stop}, "
+                f"axis_size={axis_size}."
+            )
+
+        expected_patch_len = stop - start
+        actual_patch_len = chunk_raw.shape[ax_idx]
+
+        if actual_patch_len != expected_patch_len:
+            raise ValueError(
+                "Cannot commit sliced patch because the chunk length no longer matches the target slice. "
+                f"Expected length {expected_patch_len} on axis '{self.target_ax.name}', "
+                f"got {actual_patch_len}."
+            )
+
+        left_slice = [slice(None)] * orig_raw.ndim
+        left_slice[ax_idx] = slice(None, start)
+
+        right_slice = [slice(None)] * orig_raw.ndim
+        right_slice[ax_idx] = slice(stop, None)
+
+        left_raw = orig_raw[tuple(left_slice)]
+        right_raw = orig_raw[tuple(right_slice)]
+
+        stitched_raw = jnp.concatenate([left_raw, chunk_raw, right_raw], axis=ax_idx)
+
+        return Tensor(stitched_raw, *self.original_tensor.topology)
+
+
+class TargetedSlicedMonad:
+    """
+    Targeted view into a SlicedMonad's chunk.
+
+    This is what makes things like:
+
+        x.s[10:20].d.bias()[:]
+
+    preserve the patch context instead of accidentally decaying to a plain Tensor.
+    """
+
+    def __init__(self, monad: SlicedMonad, target_axes: Tuple[Axis, ...]):
+        self.monad = monad
+        self.target_axes = target_axes
+
+    @property
+    def tensor(self):
+        return self.monad.chunk_tensor
+
+    def _targeted(self):
+        return TargetedTensor(self.monad.chunk_tensor, self.target_axes)
+
+    def _wrap(
+        self,
+        result,
+        *,
+        patch_safe: Optional[bool] = None,
+        unsafe_reason: Optional[str] = None,
+    ):
+        return self.monad._wrap(
+            result,
+            patch_safe=patch_safe,
+            unsafe_reason=unsafe_reason,
+        )
+
+    def __getattr__(self, name: str):
+        # Chain another axis while preserving patch context.
+        for axis in self.monad.chunk_tensor.topology:
+            if axis.name == name:
+                if axis not in self.target_axes:
+                    return TargetedSlicedMonad(self.monad, self.target_axes + (axis,))
+                return self
+
+        # Dynamic NN lookup / TargetedTensor methods.
+        attr = getattr(self._targeted(), name)
+
+        if callable(attr):
+            def wrapped(*args, **kwargs):
+                return self._wrap(attr(*args, **kwargs))
+            return wrapped
+
+        return attr
+
+    def pw(self, func, tie: Optional[str] = None, **kwargs):
+        return self._wrap(self._targeted().pw(func, tie=tie, **kwargs))
+
+    def proj(self, *target_axes, bias: bool = False, tie: Optional[str] = None, init=None):
+        explicit_projection = len(target_axes) > 0
+
+        result = self._targeted().proj(
+            *target_axes,
+            bias=bias,
+            tie=tie,
+            init=init,
+        )
+
+        if explicit_projection:
+            return self._wrap(
+                result,
+                patch_safe=False,
+                unsafe_reason=(
+                    "Explicit proj(...) inside a sliced patch is not commit-safe. "
+                    "Use proj() with no explicit axes for same-axis patch projection, "
+                    "or stitch manually."
+                ),
+            )
+
+        return self._wrap(result)
+
+    def bias(self, init=None, tie: Optional[str] = None):
+        return self._wrap(self._targeted().bias(init=init, tie=tie))
+
+    def gate(self, init=None, tie: Optional[str] = None):
+        return self._wrap(self._targeted().gate(init=init, tie=tie))
+
+    def mask(self, func, fill: float):
+        return self._wrap(self._targeted().mask(func, fill=fill))
+
+    def rename(self, new_axis: Axis):
+        result = self._targeted().rename(new_axis)
+        return self._wrap(
+            result,
+            patch_safe=False,
+            unsafe_reason=(
+                "rename(...) inside a sliced patch is not commit-safe. "
+                "Rename or stitch manually outside the patch monad."
+            ),
+        )
+
+    def pad(self, *pad_widths, fill: float = 0.0):
+        result = self._targeted().pad(*pad_widths, fill=fill)
+        return self._wrap(
+            result,
+            patch_safe=False,
+            unsafe_reason=(
+                "pad(...) inside a sliced patch is not commit-safe because it changes topology/size. "
+                "Pad or stitch manually outside the patch monad."
+            ),
+        )
+
+    def unfold(self, window_axis: Axis, step: int = 1):
+        result = self._targeted().unfold(window_axis, step=step)
+        return self._wrap(
+            result,
+            patch_safe=False,
+            unsafe_reason=(
+                "unfold(...) inside a sliced patch is not commit-safe because it changes topology. "
+                "Unfold or stitch manually outside the patch monad."
+            ),
+        )
+
+    def sum(self):
+        # Reductions are value-style. They do not preserve patch context.
+        return self._targeted().sum()
+
+    def mean(self):
+        return self._targeted().mean()
+
+    def max(self):
+        return self._targeted().max()
+
+    @property
+    def size(self) -> int:
+        return self._targeted().size
+
+    def __int__(self) -> int:
+        return int(self._targeted())
+
+    def __index__(self) -> int:
+        return self._targeted().__index__()
+
+    def __getitem__(self, key):
+        result = self._targeted().__getitem__(key)
+
+        # Nested slicing inside a patch is allowed as value-style behavior,
+        # but it usually will not be commit-compatible unless topology remains identical.
+        return self._wrap(result)
+
+    def __matmul__(self, other):
+        if hasattr(other, "chunk_tensor"):
+            other = other.chunk_tensor
+        return self._targeted().__matmul__(other)
 
 
 class TargetedTensor(NNTargetedTensorStubs):
@@ -552,8 +991,16 @@ class TargetedTensor(NNTargetedTensorStubs):
         return result
 
     def __getitem__(self, key: Any) -> Any:
-        if key == slice(None): return self.tensor
-        if hasattr(key, 'topology'): return RoutedContext(self.tensor, self.target_axes, key)
+        if key == slice(None):
+            return self.tensor
+
+        # If a lazy slice is used as an index, consume it as its sliced Tensor.
+        # This makes E.v[data.s[:-1]].gather() work.
+        if hasattr(key, "chunk_tensor"):
+            key = key.chunk_tensor
+
+        if hasattr(key, 'topology'):
+            return RoutedContext(self.tensor, self.target_axes, key)
 
         if len(self.target_axes) != 1:
             raise ValueError("Slicing requires exactly one target axis.")
@@ -568,9 +1015,7 @@ class TargetedTensor(NNTargetedTensorStubs):
         if isinstance(key, int):
             # Integer indexing physically removes the dimension from the array.
             new_topology = list(self.tensor.topology)
-            new_topology.pop(ax_idx)  # Drop the axis entirely!
-
-            # Return a pure Tensor (no Monad needed since it's a reduction)
+            new_topology.pop(ax_idx)
             return Tensor(sliced_raw, *new_topology)
 
         new_size = sliced_raw.shape[ax_idx]
@@ -580,8 +1025,15 @@ class TargetedTensor(NNTargetedTensorStubs):
         new_topology[ax_idx] = new_axis
         chunk_tensor = Tensor(sliced_raw, *new_topology)
 
-        # TRIGGER THE MONAD!
-        return SlicedMonad(self.tensor, target, key, chunk_tensor)
+        # Non-integer slicing creates a lazy slice / optional patch transaction.
+        return SlicedMonad(
+            self.tensor,
+            target,
+            key,
+            chunk_tensor,
+            expected_topology=chunk_tensor.topology,
+            patch_safe=True,
+        )
 
     def __dir__(self):
         """Exposes dynamic NN functions to dynamic autocomplete (Jupyter/REPL)."""
@@ -1184,6 +1636,31 @@ class RoutedContext:
 
         # Return a pure Tensor directly!
         return Tensor(res_raw, *new_top)
+
+
+def decay_monads(x):
+    """
+    Converts lazy slices into plain Tensor chunks before crossing hard boundaries
+    like jax.jit.
+
+    This implements:
+
+        slice used as value => Tensor
+        slice closed with [:] => patch commit
+    """
+    if hasattr(x, "chunk_tensor"):
+        return x.chunk_tensor
+
+    if isinstance(x, tuple):
+        return tuple(decay_monads(v) for v in x)
+
+    if isinstance(x, list):
+        return [decay_monads(v) for v in x]
+
+    if isinstance(x, dict):
+        return {k: decay_monads(v) for k, v in x.items()}
+
+    return x
 
 
 import jax

@@ -1,6 +1,6 @@
 import jax
 from functools import wraps
-from .core import compiler_state, Tensor
+from .core import compiler_state, Tensor, decay_monads
 
 from typing import Callable, Any, TypeVar, Union
 
@@ -21,6 +21,10 @@ class AxiomFunction:
         self._jitted_fn = None
 
     def __call__(self, *args, **kwargs):
+        # Lazy slices used as ordinary values should decay before tracing/init.
+        args = decay_monads(args)
+        kwargs = decay_monads(kwargs)
+
         if not self.is_initialized:
             compiler_state.is_initializing = True
             compiler_state.params = {}
@@ -33,13 +37,16 @@ class AxiomFunction:
             compiler_state.is_initializing = False
 
             def pure_fn(params, *p_args, **p_kwargs):
+                p_args = decay_monads(p_args)
+                p_kwargs = decay_monads(p_kwargs)
+
                 compiler_state.params = params
                 compiler_state.param_counter = 0
                 return self.fn(*p_args, **p_kwargs)
 
             self._jitted_fn = jax.jit(pure_fn)
 
-        # THE MAGIC FIX: Route JAX gradient tracers into the fast path if we are in a training step!
+        # Route JAX gradient tracers into the fast path if we are in a training step.
         active_params = compiler_state.step_params if compiler_state.step_params is not None else self.params
 
         return self._jitted_fn(active_params, *args, **kwargs)
@@ -77,6 +84,9 @@ def axiom_step(
         def wrapper(*args, **kwargs):
             nonlocal opt_state, _jitted_train_step
 
+            args = decay_monads(args)
+            kwargs = decay_monads(kwargs)
+
             if not model.is_initialized:
                 step_fn(*args, **kwargs)
 
@@ -84,10 +94,12 @@ def axiom_step(
                 opt_state = optimizer.init(model.params)
 
                 def pure_train_step(params, opt_state_inner, *p_args):
+                    p_args = decay_monads(p_args)
+
                     import jax.numpy as jnp
 
                     def loss_fn(p):
-                        # INJECT TRACERS: Force the model to use the gradient tape!
+                        # INJECT TRACERS: Force the model to use the gradient tape.
                         compiler_state.step_params = p
 
                         loss_tensor = step_fn(*p_args)
@@ -97,10 +109,8 @@ def axiom_step(
 
                         return jnp.sum(loss_tensor.unwrap())
 
-                    # Compute forward pass and gradients
                     loss_val, grads = jax.value_and_grad(loss_fn)(params)
 
-                    # Apply Optax updates functionally
                     updates, new_opt_state = optimizer.update(grads, opt_state_inner, params)
                     new_params = optax.apply_updates(params, updates)
 
@@ -108,10 +118,8 @@ def axiom_step(
 
                 _jitted_train_step = jax.jit(pure_train_step)
 
-            # Fast Distributed Execution
             loss_val, new_params, opt_state = _jitted_train_step(model.params, opt_state, *args)
 
-            # Update the stateful model silently
             model.params = new_params
 
             return loss_val

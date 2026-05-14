@@ -388,3 +388,252 @@ def test_scalar_indexing():
     assert last.topology == (ax.b(2),)
     assert middle.topology == (ax.b(2),)
     print("Scalar indexing passed!\n")
+
+from axiom.core import SlicedMonad
+def test_sliced_monad_scalar_math_preserves_patch():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+
+    out = (x.d[:2] * 10.0)[:]
+
+    assert isinstance(out, Tensor)
+    assert out.topology == (ax.d,)
+    assert out.topology[0].size == 4
+    assert jnp.allclose(out.unwrap(), jnp.array([10.0, 20.0, 3.0, 4.0]))
+
+def test_sliced_monad_plain_tensor_math_preserves_patch():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+    delta = wrap(jnp.array([10.0, 20.0]), ax.d(2))
+
+    out = (x.d[:2] + delta)[:]
+
+    assert isinstance(out, Tensor)
+    assert out.topology == (ax.d,)
+    assert jnp.allclose(out.unwrap(), jnp.array([11.0, 22.0, 3.0, 4.0]))
+
+def test_sliced_monad_cross_chunk_math_dissolves():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+
+    left = x.d[:2]
+    right = x.d[2:]
+
+    result = left * right
+
+    assert isinstance(left, SlicedMonad)
+    assert isinstance(right, SlicedMonad)
+    assert isinstance(result, Tensor)
+    assert result.topology[0].size == 2
+    assert jnp.allclose(result.unwrap(), jnp.array([3.0, 8.0]))
+
+def test_sliced_monad_cross_chunk_math_has_no_patch_commit():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+
+    result = x.d[:2] * x.d[2:]
+
+    assert isinstance(result, Tensor)
+
+    with pytest.raises(Exception):
+        _ = result[:]
+
+def test_sliced_monad_default_proj_is_patch_safe():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.ones(4), ax.d)
+
+    out = x.d[:2].proj()[:]
+
+    assert isinstance(out, Tensor)
+    assert out.topology == (ax.d,)
+    assert out.topology[0].size == 4
+
+def test_sliced_monad_explicit_proj_new_axis_is_not_patch_safe():
+    ax.d = ax("d", 4)
+    ax.d2 = ax("d2", 2)
+    x = wrap(jnp.ones(4), ax.d)
+
+    y = x.d[:2].proj(ax.d2)
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="Explicit proj|unsafe|topology"):
+        _ = y[:]
+
+def test_sliced_monad_explicit_proj_same_axis_is_not_patch_safe():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.ones(4), ax.d)
+
+    y = x.d[:2].proj(ax.d(2))
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="Explicit proj|unsafe|topology"):
+        _ = y[:]
+
+def test_sliced_monad_explicit_proj_same_name_wrong_size_is_not_patch_safe():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.ones(4), ax.d)
+
+    y = x.d[:2].proj(ax.d(128))
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="Explicit proj|unsafe|topology"):
+        _ = y[:]
+
+def test_sliced_monad_rename_is_not_patch_safe():
+    ax.d = ax("d", 4)
+    ax.h = ax("h", 2)
+    x = wrap(jnp.ones(4), ax.d)
+
+    y = x.d[:2].d.rename(ax.h)
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="rename|unsafe|topology"):
+        _ = y[:]
+
+def test_sliced_monad_pad_is_not_patch_safe():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.ones(4), ax.d)
+
+    y = x.d[:2].d.pad((1, 0))
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="pad|unsafe|topology"):
+        _ = y[:]
+
+def test_sliced_monad_reduction_decays_to_tensor():
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+
+    y = x.d[:2].d.sum()
+
+    assert isinstance(y, Tensor)
+    assert y.topology == ()
+    assert jnp.allclose(y.unwrap(), 3.0)
+
+def test_sliced_monad_axis_chaining_preserves_patch_context():
+    ax.s = ax("s", 4)
+    ax.d = ax("d", 3)
+
+    x = wrap(jnp.ones((4, 3)), ax.s, ax.d)
+
+    y = x.s[:2].d.bias()
+
+    assert isinstance(y, SlicedMonad)
+
+    out = y[:]
+
+    assert isinstance(out, Tensor)
+    assert out.topology == (ax.s, ax.d)
+    assert out.unwrap().shape == (4, 3)
+
+def test_sliced_monad_nested_slice_is_not_commit_compatible():
+    ax.s = ax("s", 4)
+    ax.d = ax("d", 4)
+
+    x = wrap(jnp.ones((4, 4)), ax.s, ax.d)
+
+    y = x.s[:2].d[:2]
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="topology"):
+        _ = y[:]
+
+def test_gather_accepts_sliced_monad_index():
+    ax.s = ax("s", 4)
+    ax.vocab = ax("vocab", 5)
+    ax.d = ax("d", 1)
+
+    tokens = wrap(jnp.array([1, 0, 3, 2]), ax.s)
+
+    embeddings = wrap(
+        jnp.array([[10.0], [20.0], [30.0], [40.0], [50.0]]),
+        ax.vocab,
+        ax.d,
+    )
+
+    gathered = embeddings.vocab[tokens.s[:2]].gather()
+
+    assert isinstance(gathered, Tensor)
+    assert gathered.topology == (ax.s(2), ax.d)
+    assert jnp.allclose(gathered.unwrap(), jnp.array([[20.0], [10.0]]))
+
+def test_decay_monads_turns_sliced_monad_into_tensor():
+    from axiom.core import decay_monads
+
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+
+    lazy = x.d[:2]
+    decayed = decay_monads(lazy)
+
+    assert isinstance(lazy, SlicedMonad)
+    assert isinstance(decayed, Tensor)
+    assert decayed.topology == (ax.d(2),)
+    assert jnp.allclose(decayed.unwrap(), jnp.array([1.0, 2.0]))
+
+def test_decay_monads_recurses_through_containers():
+    from axiom.core import decay_monads
+
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([1.0, 2.0, 3.0, 4.0]), ax.d)
+
+    nested = {
+        "a": x.d[:2],
+        "b": [x.d[2:], 123],
+    }
+
+    out = decay_monads(nested)
+
+    assert isinstance(out["a"], Tensor)
+    assert isinstance(out["b"][0], Tensor)
+    assert out["b"][1] == 123
+    assert jnp.allclose(out["a"].unwrap(), jnp.array([1.0, 2.0]))
+    assert jnp.allclose(out["b"][0].unwrap(), jnp.array([3.0, 4.0]))
+
+def test_sliced_monad_step_slice_commit_is_rejected():
+    ax.d = ax("d", 6)
+    x = wrap(jnp.arange(6.0), ax.d)
+
+    y = x.d[::2] * 10.0
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="step|contiguous"):
+        _ = y[:]
+
+def test_sliced_monad_negative_slice_commit_is_allowed():
+    ax.d = ax("d", 6)
+    x = wrap(jnp.arange(6.0), ax.d)
+
+    y = (x.d[-2:] * 10.0)[:]
+
+    assert isinstance(y, Tensor)
+    assert y.topology == (ax.d,)
+    assert jnp.allclose(y.unwrap(), jnp.array([0.0, 1.0, 2.0, 3.0, 40.0, 50.0]))
+
+def test_sliced_monad_negative_start_stop_commit_is_allowed():
+    ax.d = ax("d", 6)
+    x = wrap(jnp.arange(6.0), ax.d)
+
+    y = (x.d[-4:-1] + 100.0)[:]
+
+    assert isinstance(y, Tensor)
+    assert y.topology == (ax.d,)
+    assert jnp.allclose(y.unwrap(), jnp.array([0.0, 1.0, 102.0, 103.0, 104.0, 5.0]))
+
+def test_sliced_monad_step_slice_commit_is_rejected():
+    ax.d = ax("d", 6)
+    x = wrap(jnp.arange(6.0), ax.d)
+
+    y = x.d[::2] * 10.0
+
+    assert isinstance(y, SlicedMonad)
+
+    with pytest.raises(ValueError, match="step|contiguous"):
+        _ = y[:]
