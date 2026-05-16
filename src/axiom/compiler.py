@@ -65,21 +65,41 @@ class AxiomModel:
             return AxiomModel(self.fn, new_params)
         raise TypeError("Can only add parameter dictionaries to an AxiomModel.")
 
+    # --- DICTIONARY DUCK-TYPING (For ergonomic gradient routing) ---
+    def items(self):
+        return self.params.items()
+
+    def keys(self):
+        return self.params.keys()
+
+    def values(self):
+        return self.params.values()
+
+    def __getitem__(self, key: str):
+        return self.params[key]
+
+    def __setitem__(self, key: str, value: Any):
+        self.params[key] = value
+
+    def __contains__(self, key: str):
+        return key in self.params
+
 
 # Tell JAX how to flatten and unflatten our model!
 def _unflatten_model(aux, children):
-    fn, is_init = aux  # Unpack the static auxiliary data
-    params = children[0]  # Unpack the dynamic PyTree leaves (the dict)
+    fn = aux[0]  # ONLY the function is static aux data now!
+    params = children[0]
 
-    # Rebuild the model
     model = AxiomModel(fn, params)
-    model.is_initialized = is_init  # Restore its true initialization state!
+    # If JAX is unflattening this, it means we are inside the trace or execution.
+    # Therefore, the Ghost Pass has already guaranteed initialization!
+    model.is_initialized = True
     return model
 
 
 register_pytree_node(
     AxiomModel,
-    lambda m: ((m.params,), (m.fn, m.is_initialized)),  # Flatten
+    lambda m: ((m.params,), (m.fn,)),  # Flatten: Removed m.is_initialized!
     _unflatten_model  # Unflatten
 )
 
