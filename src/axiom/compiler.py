@@ -30,27 +30,33 @@ class AxiomModel:
         args = decay_monads(args)
         kwargs = decay_monads(kwargs)
 
+        # --- THE CONTEXT SWITCH ---
+        # Point the framework's global parameter state directly to THIS PyTree's parameters.
+        # This guarantees core.py and state.py natively pull JAX Tracers during compilation!
+        prev_params = compiler_state.params
+        compiler_state.params = self.params
+
+        # Reset the counter to guarantee deterministic name alignment
+        prev_counter = compiler_state.param_counter
+        compiler_state.param_counter = 0
+
         if compiler_state.is_initializing:
             # --- THE GHOST PASS ---
-            # We are executing eagerly to trace shapes and allocate parameters.
-            compiler_state.params = self.params
-
             res = self.fn(*args, **kwargs)
 
+            # Save the newly allocated parameters back into the PyTree
             self.params = compiler_state.params.copy()
             self.is_initialized = True
-            return res
         else:
             # --- PURE XLA EXECUTION ---
-            # Inject the active PyTree params into the framework's tracer context.
-            # (We save the previous state so models can call other models safely!)
-            prev_params = compiler_state.step_params
-            compiler_state.step_params = self.params
-
             res = self.fn(*args, **kwargs)
 
-            compiler_state.step_params = prev_params
-            return res
+        # --- RESTORE CONTEXT ---
+        # Allow outer models (like GANs) to resume their own parameter scopes!
+        compiler_state.param_counter = prev_counter
+        compiler_state.params = prev_params
+
+        return res
 
     # --- NATIVE MODEL CALCULUS (For Meta-Learning) ---
     def __sub__(self, other):
@@ -84,6 +90,13 @@ class AxiomModel:
     def __contains__(self, key: str):
         return key in self.params
 
+    # ADD THESE TWO METHODS:
+    def __iter__(self):
+        return iter(self.params)
+
+    def __len__(self):
+        return len(self.params)
+
 
 # Tell JAX how to flatten and unflatten our model!
 def _unflatten_model(aux, children):
@@ -109,11 +122,24 @@ register_pytree_node(
 # ==========================================
 def _trigger_ghost_pass(fn, *args, **kwargs):
     """Eagerly runs the function to auto-initialize any uninitialized AxiomModels."""
-    # Find all AxiomModels in the inputs (searching flat args for simplicity)
-    models = [arg for arg in jax.tree_util.tree_leaves(args) if isinstance(arg, AxiomModel)]
+
+    # Custom recursive walker to find AxiomModels WITHOUT flattening them into leaves!
+    def _get_models(obj):
+        models = []
+        if isinstance(obj, AxiomModel):
+            models.append(obj)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                models.extend(_get_models(item))
+        elif isinstance(obj, dict):
+            for item in obj.values():
+                models.extend(_get_models(item))
+        return models
+
+    models = _get_models(args) + _get_models(kwargs)
 
     if any(not m.is_initialized for m in models):
-        # Run exactly once in initialization mode
+        # Run exactly once in eager initialization mode
         compiler_state.is_initializing = True
         fn(*args, **kwargs)
         compiler_state.is_initializing = False
@@ -143,36 +169,41 @@ class AxiomGradWrapper:
 
     def __call__(self, *args, **kwargs):
         import jax.numpy as jnp
+        import jax
 
-        # 1. Ghost Pass
-        _trigger_ghost_pass(self.fn, *args, **kwargs)
+        # --- 1. THE GHOST PASS BYPASS ---
+        # If we are eagerly initializing, DO NOT let JAX trace!
+        if getattr(compiler_state, 'is_initializing', False):
+            out = self.fn(*args, **kwargs)
 
-        # 2. The Smuggling Function
+            # Create a mock PyTree of zero-gradients so `apply_updates`
+            # doesn't crash during the rest of the eager step!
+            m = args[0]  # The model being differentiated
+            mock_params = {k: jnp.zeros_like(v.unwrap() if hasattr(v, 'unwrap') else v) for k, v in m.params.items()}
+            mock_grads = AxiomModel(m.fn, mock_params)
+
+            if self.is_value_and_grad:
+                return out, mock_grads
+            return mock_grads
+
+        # --- 2. PURE XLA COMPILATION ---
         def jax_compatible_fn(*f_args, **f_kwargs):
             out = self.fn(*f_args, **f_kwargs)
-
             if self.has_aux:
                 loss_tensor, aux = out
-                # Give JAX the raw scalar, smuggle the original 'out' tuple via aux
                 return jnp.sum(loss_tensor.unwrap()), out
             else:
                 loss_tensor = out
-                # Give JAX the raw scalar, smuggle the original Tensor via aux
                 return jnp.sum(loss_tensor.unwrap()), out
 
-        # 3. Execute JAX Gradient function (Forcing has_aux=True internally)
         if self.is_value_and_grad:
-            # JAX returns ((raw_scalar, smuggled_out), grads)
             (_, smuggled_out), grads = jax.value_and_grad(jax_compatible_fn, has_aux=True)(*args, **kwargs)
             return smuggled_out, grads
         else:
-            # JAX returns (grads, smuggled_out)
             grads, smuggled_out = jax.grad(jax_compatible_fn, has_aux=True)(*args, **kwargs)
             if self.has_aux:
-                _, aux = smuggled_out
-                return grads, aux
-            else:
-                return grads
+                return grads, smuggled_out[1]
+            return grads
 
 
 # ==========================================

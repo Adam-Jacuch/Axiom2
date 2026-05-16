@@ -41,9 +41,9 @@ def step(model, state, x, y):
 
 def data():
     """data loader"""
+    x = init.normal(ax.b(4), ax.s(16), ax.d(32))
+    y = init.normal(ax.b(4), ax.s(16), ax.d(32))
     for _ in range(100):
-        x = init.normal(ax.b(4), ax.s(16), ax.d(32))
-        y = init.normal(ax.b(4), ax.s(16), ax.d(32))
         yield x.d.softmax(), y.d.softmax()
 
 for x, y in data():
