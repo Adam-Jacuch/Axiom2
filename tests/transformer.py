@@ -1,4 +1,4 @@
-from axiom import ax, nn, Tensor, init, axiom_jit, axiom_step
+from axiom import ax, nn, Tensor, init
 import jax.numpy as jnp
 import optax
 
@@ -19,22 +19,25 @@ def block(x: Tensor):
     """block: standard transformer block"""
     return x + swiglu(attention(x))
 
-@axiom_jit
 def transformer(x: Tensor, depth: int = 8):
     """transformer"""
     for _ in range(depth):
         x = block(x)
     return x
 
+model = ax.model(transformer)
 optim = optax.adam(1e-3)
+state = None
 
-@axiom_step(model=transformer, optimizer=optim)
-def step(x, y):
+@ax.jit
+def step(model, state, x, y):
     """step: standard transformer step"""
-    out = transformer(x)
-    loss = nn.bce_with_logits(out, y).b.s.d.mean()
-    transformer.vjp(loss)
-    return loss
+    def loss_fn(model):
+        out = model(x)
+        return nn.bce_with_logits(out, y).b.s.d.mean()
+    loss, grads = ax.value_and_grad(loss_fn)(model)
+    model, state = ax.apply_updates(model, grads, optim, state)
+    return model, state, loss
 
 def data():
     """data loader"""
@@ -44,5 +47,5 @@ def data():
         yield x.d.softmax(), y.d.softmax()
 
 for x, y in data():
-    loss = step(x, y)
+    model, state, loss = step(model, state, x, y)
     print(f"loss: {loss:.4f}") # dataset is purely random, so loss will not decrease here!

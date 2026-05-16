@@ -72,6 +72,32 @@ class _AxisNamespace:
     def __call__(self, name: str, size: Optional[int] = None) -> Axis:
         return Axis(name, size)
 
+    # Compiler namespace aliases
+    def model(self, fn) -> 'AxiomModel':
+        """Allows `model = ax.model(fn)` or `@ax.model` decorator."""
+        from .compiler import AxiomModel
+        return AxiomModel(fn)
+
+    @property
+    def jit(self):
+        from .compiler import jit
+        return jit
+
+    @property
+    def value_and_grad(self):
+        from .compiler import value_and_grad
+        return value_and_grad
+
+    @property
+    def grad(self):
+        from .compiler import grad
+        return grad
+
+    @property
+    def apply_updates(self):
+        from .compiler import apply_updates
+        return apply_updates
+
     def __getattr__(self, name: str) -> Axis:
         """
         The Magic Inline Creator!
@@ -1580,6 +1606,20 @@ class Tensor(NNTensorStubs):
         """Allows bundling via the & operator: (x & y).d.proj()"""
         return Bundle(self, other)
 
+    def item(self) -> float:
+        """Extracts a scalar Tensor as a standard Python float."""
+        import numpy as np
+        # Convert the JAX array to a NumPy scalar, then to a Python float
+        return float(np.array(self.unwrap()).item())
+
+    def __float__(self) -> float:
+        """Allows float(loss)"""
+        return self.item()
+
+    def __format__(self, format_spec: str) -> str:
+        """Allows f-string formatting: f'{loss:.4f}'"""
+        return format(self.item(), format_spec)
+
     def __dir__(self):
         """Exposes dynamic NN functions to dynamic autocomplete (Jupyter/REPL)."""
         from . import nn
@@ -1650,6 +1690,9 @@ def decay_monads(x):
     """
     if hasattr(x, "chunk_tensor"):
         return x.chunk_tensor
+
+    if isinstance(x, Bundle):
+        return Bundle(*[decay_monads(t) for t in x.tensors])
 
     if isinstance(x, tuple):
         return tuple(decay_monads(v) for v in x)
