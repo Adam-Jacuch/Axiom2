@@ -153,6 +153,24 @@ def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor) -> Tensor:
     return Tensor(loss_raw, *out_topology)
 
 
+def reinforce(logits: 'TargetedTensor', actions: Tensor, advantages: Tensor) -> Tensor:
+    """
+    Standard Policy Gradient Loss.
+    logits: The unnormalized action probabilities, targeted on the action axis (e.g., out.a)
+    actions: The chosen integer actions.
+    advantages: The TD-Error or Advantage scalar (must be detached from the gradient!).
+    """
+    # Cross entropy calculates the negative log probability of the chosen action.
+    neg_log_prob = cross_entropy_loss(logits, actions)
+
+    # Multiply by the advantage (which acts as a scaling weight)
+    # We use .pw() to ensure we don't accidentally backprop through the advantage!
+    import jax
+    safe_advantages = advantages.pw(jax.lax.stop_gradient)
+
+    return neg_log_prob * safe_advantages
+
+
 # ==========================================
 # 3. ACTIVATIONS (JAX Aliases)
 # ==========================================

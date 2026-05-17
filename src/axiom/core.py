@@ -73,10 +73,10 @@ class _AxisNamespace:
         return Axis(name, size)
 
     # Compiler namespace aliases
-    def model(self, fn) -> 'AxiomModel':
+    def model(self, fn, params=None) -> 'AxiomModel':
         """Allows `model = ax.model(fn)` or `@ax.model` decorator."""
         from .compiler import AxiomModel
-        return AxiomModel(fn)
+        return AxiomModel(fn, params)
 
     @property
     def jit(self):
@@ -572,6 +572,9 @@ class TargetedSlicedMonad:
     def mask(self, func, fill: float):
         return self._wrap(self._targeted().mask(func, fill=fill))
 
+    def vmask(self, func, fill: float):
+        return self._wrap(self._targeted().vmask(func, fill=fill))
+
     def rename(self, new_axis: Axis):
         result = self._targeted().rename(new_axis)
         return self._wrap(
@@ -791,6 +794,19 @@ class TargetedTensor(NNTargetedTensorStubs):
 
         return Tensor(result_raw, *self.tensor.topology)
 
+    def vmask(self, func, fill: float = 0.0) -> 'Tensor':
+        """Value-based masking. Masks the tensor based on its own values."""
+        import jax.numpy as jnp
+
+        # The lambda evaluates the raw n-dim array
+        bool_mask = func(self.tensor.unwrap())
+
+        # Apply the mask directly using pure JAX
+        result_raw = jnp.where(bool_mask, fill, self.tensor.unwrap())
+
+        # Wrap it back up using the tensor's full original topology!
+        return Tensor(result_raw, *self.tensor.topology)
+
     def unfold(self, window_axis: Axis, step: int = 1) -> 'Tensor':
         """Creates a sliding window over a spatial sequence for convolutions."""
         import jax.numpy as jnp
@@ -869,6 +885,19 @@ class TargetedTensor(NNTargetedTensorStubs):
         y_seq = Tensor(y_seq_raw, *self.tensor.topology)
 
         return final_carry, y_seq
+
+    def sample(self) -> 'Tensor':
+        """Samples an integer index from the targeted logits/probabilities."""
+        import jax
+        from .state import state  # Use your brilliant state manager for the key!
+
+        class_idx = self.tensor.topology.index(self.target_axes[0])
+        out_topology = tuple(a for a in self.tensor.topology if a not in self.target_axes)
+
+        # JAX categorical expects raw logits (un-softmaxed)
+        sampled_raw = jax.random.categorical(state.next_key(), self.tensor.unwrap(), axis=class_idx)
+
+        return Tensor(sampled_raw, *out_topology)
 
     def pad(self, *pad_widths: Tuple[int, int], fill: float = 0.0) -> 'Tensor':
         """Native topological padding. e.g., x.seq.pad((1, 2)) or x.h.w.pad((1,1), (2,2))"""
@@ -1282,6 +1311,24 @@ class TargetedBundle(NNTargetedBundleStubs):
             results.append(t_tensor.mask(func, fill=fill))
         return tuple(results)
 
+    def vmask(self, func, fill: float = 0.0) -> Tuple['Tensor', ...]:
+        """Parallel value-based masking across the bundle."""
+        import jax.numpy as jnp
+
+        # Extract all raw arrays (JAX natively handles broadcasting if they differ)
+        raw_arrays = [t.unwrap() for t in self.bundle.tensors]
+        bool_mask = func(*raw_arrays)
+
+        results = []
+        for tensor in self.bundle.tensors:
+            # bool_mask and tensor.unwrap() are raw JAX arrays, jnp.where is perfectly safe!
+            masked_raw = jnp.where(bool_mask, fill, tensor.unwrap())
+
+            # The topology of each tensor remains completely unchanged
+            results.append(Tensor(masked_raw, *tensor.topology))
+
+        return tuple(results)
+
     def __dir__(self):
         """Exposes dynamic NN functions to dynamic autocomplete (Jupyter/REPL)."""
         from . import nn
@@ -1506,6 +1553,12 @@ class Tensor(NNTensorStubs):
         aligned_self = self._align_to(union_axes)
         aligned_other = other._align_to(union_axes)
         return Tensor(op_func(aligned_self, aligned_other), *union_axes)
+
+
+    def stop_grad(self) -> 'Tensor':
+        """Detaches the tensor from the JAX gradient computation graph."""
+        import jax
+        return self.pw(jax.lax.stop_gradient)
 
 
     # Dunder Math Methods

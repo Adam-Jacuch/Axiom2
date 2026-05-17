@@ -1,100 +1,81 @@
-import jax
 import jax.numpy as jnp
 import optax
-from axiom import ax, Tensor, wrap, axiom_jit, axiom_step, nn
+from axiom import ax, nn, init, Tensor
+
+class Env:
+    """Env: batched 2d discrete target seeker"""
+
+    def __init__(self, batch_size=32):
+        self.b = ax.b(batch_size)
+        self.agent = init.zeros(self.b, ax.d(2)).unwrap()
+        self.target = jnp.round(init.normal(self.b, ax.d(2)).unwrap() * 5.0)
+        self.dist = jnp.linalg.norm(self.target - self.agent, axis=-1)
+
+    def obs(self):
+        """obs: returns relative distance vector"""
+        return Tensor(self.target - self.agent, self.b, ax.d(2))
+
+    def step(self, action: Tensor):
+        """step: applies discrete action and calculates reward"""
+        moves = jnp.array([[0, 1], [0, -1], [-1, 0], [1, 0], [0, 0]])
+        self.agent += moves[action.unwrap()]
+        self.agent = jnp.clip(self.agent, -10.0, 10.0)
+        new_dist = jnp.linalg.norm(self.target - self.agent, axis=-1)
+        is_parked = (new_dist < 0.1)
+        reward = (self.dist - new_dist) + (is_parked * 0.2)
+        self.dist = new_dist
+        return self.obs(), Tensor(reward, self.b)
+
+@ax.model
+def actor(x: Tensor):
+    """actor: outputs unnormalized logits for 5 discrete directions"""
+    return x.d.proj(ax.h(32)).h.silu().h.proj(ax.a(5))
+
+@ax.model
+def critic(x: Tensor):
+    """critic: evaluates state value, summing v(1) to return clean topology (b)"""
+    return x.d.proj(ax.h(32)).h.silu().h.proj(ax.v(1)).v.sum()
+
+actor_optim = optax.adam(1e-3)
+critic_optim = optax.adam(1e-3)
+actor_state = None
+critic_state = None
 
 
-# ==========================================
-# 1. THE AXIOM POLICY NETWORK (ACTOR)
-# ==========================================
-@axiom_jit
-def policy_network(state: Tensor):
-    """Predicts the mean (mu) of the optimal action distribution."""
-    # Notice the inline axis sizes!
-    h = state.state_d.proj(ax.hidden_d(32)).pw(nn.relu)
-    mu = h.hidden_d.proj(ax.action_d(2))
-    return mu
+@ax.jit
+def train_step(actor, critic, act_state, crit_state, x, action, reward, next_x):
+    def critic_loss(c_model):
+        v = c_model(x)
+        next_v = c_model(next_x).stop_grad()
+        target = reward + next_v * 0.99
+        return nn.mse_loss(v, target).b.mean()
 
+    c_loss, c_grads = ax.value_and_grad(critic_loss)(critic)
+    critic, crit_state = ax.apply_updates(critic, c_grads, critic_optim, crit_state)
 
-# ==========================================
-# 2. THE DISTRIBUTED TRAINING ENGINE
-# ==========================================
-optimizer = optax.adam(learning_rate=0.05)
+    def actor_loss(a_model):
+        logits = a_model(x)
+        v = critic(x).stop_grad()
+        next_v = critic(next_x).stop_grad()
+        td_error = reward + next_v * 0.99 - v
+        return nn.reinforce(logits.a, action, td_error).b.mean()
 
+    a_loss, a_grads = ax.value_and_grad(actor_loss)(actor)
+    actor, act_state = ax.apply_updates(actor, a_grads, actor_optim, act_state)
 
-@axiom_step(model=policy_network, optimizer=optimizer)
-def train_step(state: Tensor, taken_action: Tensor, reward: Tensor):
-    """Pure functional REINFORCE Policy Gradient."""
-    mu = policy_network(state)
+    return actor, critic, act_state, crit_state, a_loss, c_loss
 
-    # 1. Calculate the Log Probability of the action taken
-    # Assuming a Gaussian policy with variance = 1: log_prob ∝ -0.5 * (x - mu)^2
-    log_prob = (taken_action - mu).pw(jnp.square) * -0.5
+env = Env()
+x = env.obs()
 
-    # Subtract the mean reward to create an Advantage!
-    # Axiom natively broadcasts the scalar mean across the batch!
-    advantage = reward - reward.b.mean()
+for i in range(1000):
+    logits = actor(x)
+    action = logits.a.sample()
+    next_x, reward = env.step(action)
 
-    # 2. Policy Gradient Objective
-    # We want to maximize expected reward, which means minimizing: -(log_prob * reward)
-    # Axiom natively broadcasts the 'b' axis of the reward across the action dimensions!
-    loss = -(log_prob * advantage).b.action_d.mean()
+    actor, critic, actor_state, critic_state, a_loss, c_loss = train_step(
+        actor, critic, actor_state, critic_state, x, action, reward, next_x
+    )
 
-    # 3. Syntactic Sugar
-    policy_network.vjp(loss)
-    policy_network.step()
-
-    return loss
-
-
-# ==========================================
-# 3. THE RL ENVIRONMENT LOOP
-# ==========================================
-def run_training():
-    print("Initializing Axiom Continuous RL Environment...")
-    key = jax.random.PRNGKey(42)
-    batch_size = 128
-
-    # Define the static hidden rules of the environment
-    env_key = jax.random.PRNGKey(99)
-    W_env_raw = jax.random.normal(env_key, (4, 2))
-    W_env = wrap(W_env_raw, ax.state_d(4), ax.action_d(2))
-
-    for epoch in range(1, 2001):
-        key, s_key, a_key = jax.random.split(key, 3)
-
-        # 1. Environment: Generate Random States
-        raw_states = jax.random.normal(s_key, (batch_size, 4))
-        states = wrap(raw_states, ax.b(batch_size), ax.state_d(4))
-
-        # 2. Agent: Choose Actions (Exploration via Gaussian Noise)
-        # We can call our compiled model eagerly to get the mean!
-        mu_tensor = policy_network(states)
-
-        noise_raw = jax.random.normal(a_key, (batch_size, 2))
-        noise_tensor = wrap(noise_raw, ax.b(batch_size), ax.action_d(2))
-
-        # Axiom Native Math
-        taken_actions = mu_tensor + noise_tensor
-
-        # 3. Environment: Compute Reward
-        # Pure Axiom Math: Multiply the state by the hidden environment matrix and sum!
-        optimal_actions = (states * W_env).state_d.sum()
-
-        # Reward is the negative Euclidean distance to the optimal action
-        distances = (taken_actions - optimal_actions).pw(jnp.square).action_d.sum().pw(jnp.sqrt)
-        rewards = -distances
-
-        # 4. Agent: Learn from the Experience
-        loss = train_step(states, taken_actions, rewards)
-
-        # Print progress
-        if epoch % 20 == 0:
-            avg_reward = rewards.b.mean().unwrap()
-            print(f"Epoch {epoch:03d} | Avg Reward: {avg_reward:7.3f} | Loss: {loss:7.3f}")
-
-    print("\nTraining Complete! The Axiom engine successfully optimized the policy.")
-
-
-if __name__ == "__main__":
-    run_training()
+    print(f"loss: {c_loss:.4f} | dist: {env.dist.mean():.2f}")
+    x = next_x

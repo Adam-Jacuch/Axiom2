@@ -31,45 +31,63 @@ class AxiomModel:
         kwargs = decay_monads(kwargs)
 
         # --- THE CONTEXT SWITCH ---
-        # Point the framework's global parameter state directly to THIS PyTree's parameters.
-        # This guarantees core.py and state.py natively pull JAX Tracers during compilation!
-        prev_params = compiler_state.params
+        prev_params = getattr(compiler_state, 'params', {})
         compiler_state.params = self.params
 
         # Reset the counter to guarantee deterministic name alignment
-        prev_counter = compiler_state.param_counter
+        prev_counter = getattr(compiler_state, 'param_counter', 0)
         compiler_state.param_counter = 0
 
-        if compiler_state.is_initializing:
+        # FIX: Auto-detect if we need a local Eager Ghost Pass!
+        is_uninitialized = not self.is_initialized
+        is_global_init = getattr(compiler_state, 'is_initializing', False)
+
+        if is_global_init or is_uninitialized:
             # --- THE GHOST PASS ---
+            compiler_state.is_initializing = True
+
             res = self.fn(*args, **kwargs)
 
             # Save the newly allocated parameters back into the PyTree
             self.params = compiler_state.params.copy()
             self.is_initialized = True
+
+            # Restore the global state in case we are inside another trace
+            compiler_state.is_initializing = is_global_init
         else:
             # --- PURE XLA EXECUTION ---
             res = self.fn(*args, **kwargs)
 
         # --- RESTORE CONTEXT ---
-        # Allow outer models (like GANs) to resume their own parameter scopes!
         compiler_state.param_counter = prev_counter
         compiler_state.params = prev_params
 
         return res
 
-    # --- NATIVE MODEL CALCULUS (For Meta-Learning) ---
+    # --- NATIVE MODEL CALCULUS (For Meta-Learning & RL) ---
     def __sub__(self, other):
-        if isinstance(other, dict):  # Subtracting gradients
+        if isinstance(other, dict):
             new_params = jax.tree_util.tree_map(lambda p, g: p - g, self.params, other)
             return AxiomModel(self.fn, new_params)
-        raise TypeError("Can only subtract parameter dictionaries (gradients) from an AxiomModel.")
+        raise TypeError("Can only subtract parameter dictionaries from an AxiomModel.")
 
     def __add__(self, other):
+        # Allow adding two Neural Networks together!
+        if isinstance(other, AxiomModel):
+            new_params = jax.tree_util.tree_map(lambda p1, p2: p1 + p2, self.params, other.params)
+            return AxiomModel(self.fn, new_params)
+        # Allow adding gradient dictionaries
         if isinstance(other, dict):
             new_params = jax.tree_util.tree_map(lambda p, g: p + g, self.params, other)
             return AxiomModel(self.fn, new_params)
-        raise TypeError("Can only add parameter dictionaries to an AxiomModel.")
+        raise TypeError("Can only add parameter dicts or AxiomModels to an AxiomModel.")
+
+    def __mul__(self, scalar: float):
+        # Allow multiplying an entire Neural Network by a scalar!
+        if isinstance(scalar, (int, float)):
+            new_params = jax.tree_util.tree_map(lambda p: p * scalar, self.params)
+            return AxiomModel(self.fn, new_params)
+        raise TypeError("Can only multiply an AxiomModel by a scalar float/int.")
 
     # --- DICTIONARY DUCK-TYPING (For ergonomic gradient routing) ---
     def items(self):

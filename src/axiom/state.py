@@ -50,11 +50,10 @@ class AxiomStateManager:
 
         # 2. Ghost Pass Allocation
         # Write DIRECTLY to compiler_state so the PyTree can package it up!
-        if getattr(compiler_state, 'is_initializing', False):
-            if true_name not in compiler_state.params:
-                # Initialize with our secure key manager!
-                new_param = init_fn(self.next_key(), shape, **init_kwargs)
-                compiler_state.params[true_name] = new_param
+        if true_name not in compiler_state.params:
+            # Initialize with our secure key manager!
+            new_param = init_fn(self.next_key(), shape, **init_kwargs)
+            compiler_state.params[true_name] = new_param
 
         # 3. Execution & Validation
         # Read the active Tracers seamlessly from compiler_state.params
