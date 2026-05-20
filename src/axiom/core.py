@@ -98,6 +98,29 @@ class _AxisNamespace:
         from .compiler import apply_updates
         return apply_updates
 
+    def stack(self, tensors: list['Tensor'], new_axis: 'Axis') -> 'Tensor':
+        """Stacks a list of Tensors along a brand new axis."""
+        import jax.numpy as jnp
+
+        if not tensors:
+            raise ValueError("Cannot stack an empty list of tensors.")
+
+        base_top = tensors[0].topology
+        for t in tensors:
+            if t.topology != base_top:
+                raise ValueError(
+                    f"Topology mismatch in stack: expected {[a.name for a in base_top]}, "
+                    f"got {[a.name for a in t.topology]}."
+                )
+
+        raw_arrays = [t.unwrap() for t in tensors]
+
+        # Stack places the new dimension at index 0
+        stacked_raw = jnp.stack(raw_arrays, axis=0)
+
+        # Prepend the new Axis to the topology
+        return wrap(stacked_raw, new_axis, *base_top)
+
     def __getattr__(self, name: str) -> Axis:
         """
         The Magic Inline Creator!
@@ -886,16 +909,29 @@ class TargetedTensor(NNTargetedTensorStubs):
 
         return final_carry, y_seq
 
-    def sample(self) -> 'Tensor':
-        """Samples an integer index from the targeted logits/probabilities."""
+    def sample(self, temp: float = 1.0) -> 'Tensor':
+        """
+        Samples an integer index from the targeted logits.
+        temp=1.0: Standard stochastic sampling.
+        temp=0.0: Deterministic greedy selection (argmax).
+        temp>1.0: Increases randomness/exploration.
+        """
         import jax
-        from .state import state  # Use your brilliant state manager for the key!
+        import jax.numpy as jnp
+        from .state import state
 
         class_idx = self.tensor.topology.index(self.target_axes[0])
         out_topology = tuple(a for a in self.tensor.topology if a not in self.target_axes)
 
-        # JAX categorical expects raw logits (un-softmaxed)
-        sampled_raw = jax.random.categorical(state.next_key(), self.tensor.unwrap(), axis=class_idx)
+        logits_raw = self.tensor.unwrap()
+
+        if temp == 0.0:
+            # Pure greedy deterministic selection
+            sampled_raw = jnp.argmax(logits_raw, axis=class_idx)
+        else:
+            # Scale logits by temperature before categorical sampling
+            scaled_logits = logits_raw / temp
+            sampled_raw = jax.random.categorical(state.next_key(), scaled_logits, axis=class_idx)
 
         return Tensor(sampled_raw, *out_topology)
 
@@ -1477,6 +1513,16 @@ class Tensor(NNTensorStubs):
         """
         raw_result = func(self.unwrap(), **kwargs)
         return Tensor(raw_result, *self._axes)
+
+    def minimum(self, other: 'Tensor') -> 'Tensor':
+        """Element-wise minimum, broadcasting over topologies automatically."""
+        import jax.numpy as jnp
+        return self._broadcast_op(other, jnp.minimum)
+
+    def maximum(self, other: 'Tensor') -> 'Tensor':
+        """Element-wise maximum, broadcasting over topologies automatically."""
+        import jax.numpy as jnp
+        return self._broadcast_op(other, jnp.maximum)
 
     def apply_n(self, func: callable, times: int) -> 'Tensor':
         """
