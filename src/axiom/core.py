@@ -1402,6 +1402,40 @@ class Bundle:
                     return TargetedBundle(self, (axis,))
         raise AttributeError(f"Axis '{name}' not found in bundled tensors.")
 
+    def _pairwise(self, op_name: str) -> 'Tensor':
+        """
+        Reduces a bundle of tensors into one tensor using a topology-aware
+        elementwise pairwise op, such as minimum or maximum.
+        """
+        if not self.tensors:
+            raise ValueError(f"Cannot compute bundle {op_name} over an empty Bundle.")
+
+        if len(self.tensors) == 1:
+            return self.tensors[0]
+
+        out = self.tensors[0]
+
+        for tensor in self.tensors[1:]:
+            out = getattr(out, op_name)(tensor)
+
+        return out
+
+    def minimum(self) -> 'Tensor':
+        """Elementwise minimum across all tensors in the bundle."""
+        return self._pairwise("minimum")
+
+    def maximum(self) -> 'Tensor':
+        """Elementwise maximum across all tensors in the bundle."""
+        return self._pairwise("maximum")
+
+    def min(self) -> 'Tensor':
+        """Alias for minimum()."""
+        return self.minimum()
+
+    def max(self) -> 'Tensor':
+        """Alias for maximum()."""
+        return self.maximum()
+
     def apply_n(self, func: callable, times: int) -> 'Bundle':
         """
         Recursively applies a function `times` times across bundled states using jax.lax.scan.
@@ -1514,12 +1548,12 @@ class Tensor(NNTensorStubs):
         raw_result = func(self.unwrap(), **kwargs)
         return Tensor(raw_result, *self._axes)
 
-    def minimum(self, other: 'Tensor') -> 'Tensor':
+    def minimum(self, other) -> 'Tensor':
         """Element-wise minimum, broadcasting over topologies automatically."""
         import jax.numpy as jnp
         return self._broadcast_op(other, jnp.minimum)
 
-    def maximum(self, other: 'Tensor') -> 'Tensor':
+    def maximum(self, other) -> 'Tensor':
         """Element-wise maximum, broadcasting over topologies automatically."""
         import jax.numpy as jnp
         return self._broadcast_op(other, jnp.maximum)

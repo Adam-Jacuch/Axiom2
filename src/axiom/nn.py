@@ -190,6 +190,11 @@ tanh = jax.numpy.tanh
 softplus = jax.nn.softplus
 log_sigmoid = jax.nn.log_sigmoid
 
+# General pointwise math
+exp = jnp.exp
+clip = jnp.clip
+clamp = jnp.clip
+
 # Axis-aware Reductions
 # (Our .pw() wrapper will automatically inject the 'axis=' argument for these!)
 softmax = jax.nn.softmax
