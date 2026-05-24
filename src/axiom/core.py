@@ -40,34 +40,44 @@ class CompilerState:
         """Resolves global ties (@) vs local execution scopes."""
         import inspect
 
-        # 1. Global Tie
+        # Global Tie
         if explicit_name is not None and explicit_name.startswith('@'):
             return explicit_name[1:]
 
-        # 2. Local Execution Scope Resolution
+        # Local Execution Scope Resolution
         scope_func = "global"
-        frame_id = None
+        target_frame = None
+
+        stack = inspect.stack()
+        alive_frames = {f.frame for f in stack}
+
+        # Lazy Frame Cleanup
+        # We hold the ACTUAL frame object to prevent memory address reuse.
+        # Here, we safely drop any frame that has returned and is no longer in the call stack.
+        dead_frames = [f for f in self.active_frames if f not in alive_frames]
+        for f in dead_frames:
+            del self.active_frames[f]
 
         # Walk up the stack and ignore all Axiom library code to find the user's function!
-        for frame_info in inspect.stack():
+        for frame_info in stack:
             if "axiom/" not in frame_info.filename.replace("\\", "/"):
                 scope_func = frame_info.function
-                frame_id = id(frame_info.frame)
+                target_frame = frame_info.frame
                 break
 
-        # 3. Execution Instance Isolation (e.g., layer_norm_0 vs layer_norm_1)
-        if frame_id is not None:
-            if frame_id not in self.active_frames:
+        # Execution Instance Isolation (e.g., gqa_0 vs gqa_1)
+        if target_frame is not None:
+            if target_frame not in self.active_frames:
                 count = self.func_calls.get(scope_func, 0)
                 self.func_calls[scope_func] = count + 1
-                self.active_frames[frame_id] = f"{scope_func}_{count}"
-            scope_id = self.active_frames[frame_id]
+                self.active_frames[target_frame] = f"{scope_func}_{count}"
+            scope_id = self.active_frames[target_frame]
         else:
             scope_id = scope_func
 
-        # 4. Tie assignment
+        # Tie assignment
         if explicit_name:
-            return f"{scope_id}/{explicit_name}"  # Ties within THIS specific function execution!
+            return f"{scope_id}/{explicit_name}"  # Ties within THIS specific function execution
         else:
             p_name = f"{scope_id}/{fallback_prefix}_{self.param_counter}"
             self.param_counter += 1

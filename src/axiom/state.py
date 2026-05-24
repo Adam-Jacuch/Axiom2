@@ -1,4 +1,3 @@
-import inspect
 from typing import Any, Callable
 import jax
 from .core import compiler_state
