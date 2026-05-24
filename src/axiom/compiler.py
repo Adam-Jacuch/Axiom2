@@ -276,3 +276,46 @@ def apply_updates(model: AxiomModel, grads: Any, optimizer: Any, opt_state: Any)
 
     # 3. Return the new Immutable PyTree
     return new_model, new_opt_state
+
+
+def to_jax(model: AxiomModel):
+    """
+    Converts an AxiomModel into a pure JAX (params, apply_fn) paradigm.
+    This allows for fine-grained manual control (like jax.vjp, custom gradients, etc.)
+    """
+    if not model.is_initialized:
+        raise ValueError("AxiomModel must be initialized (run an eager forward pass) before converting to pure JAX.")
+
+    # The parameters are already a flat dictionary of raw jax.Arrays!
+    params = model.params.copy()
+
+    def apply_fn(params_dict, *args, **kwargs):
+        from .core import decay_monads, compiler_state
+
+        args = decay_monads(args)
+        kwargs = decay_monads(kwargs)
+
+        # 1. Snapshot the state
+        prev_params = getattr(compiler_state, 'params', {})
+        prev_counter = getattr(compiler_state, 'param_counter', 0)
+        prev_frames = compiler_state.active_frames.copy()
+        prev_calls = compiler_state.func_calls.copy()
+
+        # 2. Inject the pure functional parameters
+        compiler_state.params = params_dict
+        compiler_state.param_counter = 0
+        compiler_state.active_frames.clear()
+        compiler_state.func_calls.clear()
+
+        # 3. Execute and safely restore
+        try:
+            res = model.fn(*args, **kwargs)
+        finally:
+            compiler_state.param_counter = prev_counter
+            compiler_state.active_frames = prev_frames
+            compiler_state.func_calls = prev_calls
+            compiler_state.params = prev_params
+
+        return res
+
+    return params, apply_fn

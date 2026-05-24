@@ -151,17 +151,27 @@ class _AxisNamespace:
         from .compiler import apply_updates
         return apply_updates
 
-    def stack(self, tensors: list['Tensor'], new_axis: 'Axis') -> 'Tensor':
-        if not tensors:
-            raise ValueError("Cannot stack an empty list of tensors.")
+    def stack(self, items: list[Any], new_axis: 'Axis') -> Any:
+        if not items:
+            raise ValueError("Cannot stack an empty list.")
 
-        base_top = tensors[0].topology
-        for t in tensors:
+        # Recursive Bundle Stacking
+        if hasattr(items[0], 'tensors'):  # Duck-typing for Bundle
+            num_inner = len(items[0].tensors)
+            stacked_tensors = []
+            for i in range(num_inner):
+                # Extract the i-th tensor across all bundles and stack them
+                inner_list = [bundle.tensors[i] for bundle in items]
+                stacked_tensors.append(self.stack(inner_list, new_axis))
+            return Bundle(*stacked_tensors)
+
+        base_top = items[0].topology
+        for t in items:
             if t.topology != base_top:
-                raise ValueError(
-                    f"Topology mismatch in stack: expected {[a.name for a in base_top]}, got {[a.name for a in t.topology]}.")
+                raise ValueError(f"Topology mismatch in stack: expected {[a.name for a in base_top]}, got {[a.name for a in t.topology]}.")
 
-        raw_arrays = [t.unwrap() for t in tensors]
+        import jax.numpy as jnp
+        raw_arrays = [t.unwrap() for t in items]
         stacked_raw = jnp.stack(raw_arrays, axis=0)
         return wrap(stacked_raw, new_axis, *base_top)
 
@@ -225,7 +235,7 @@ class SlicedMonad:
     def pw(self, func, **kwargs) -> 'SlicedMonad':
         return self._wrap(TargetedTensor(self.chunk_tensor, (self._current_target_ax(),)).pw(func, **kwargs))
 
-    def proj(self, *target_axes, bias: bool = False, tie: Optional[str] = None, init=None) -> 'SlicedMonad':
+    def proj(self, *target_axes, bias: bool = True, tie: Optional[str] = None, init=None) -> 'SlicedMonad':
         new_chunk = TargetedTensor(self.chunk_tensor, (self._current_target_ax(),)).proj(*target_axes, bias=bias,
                                                                                          tie=tie, init=init)
         if len(target_axes) > 0:
@@ -462,7 +472,7 @@ class TargetedTensor(NNTargetedTensorStubs):
 
     # --- TOPOLOGICAL MUTATORS & PARAMETER ALLOCATORS (The Explicit overrides) ---
 
-    def proj(self, *target_axes: 'Axis', bias: bool = False, tie: Optional[str] = None, init=None) -> 'Tensor':
+    def proj(self, *target_axes: 'Axis', bias: bool = True, tie: Optional[str] = None, init=None) -> 'Tensor':
         if not target_axes: target_axes = self.target_axes
 
         import numpy as np
@@ -518,6 +528,39 @@ class TargetedTensor(NNTargetedTensorStubs):
 
     def vmask(self, func, fill: float = 0.0) -> 'Tensor':
         return Tensor(jnp.where(func(self.tensor.unwrap()), fill, self.tensor.unwrap()), *self.tensor.topology)
+
+    def merge(self, new_axis: Axis) -> 'Tensor':
+        """
+        Pure topological flattening.
+        Merges all targeted axes into a single new axis.
+        e.g., x.h.w.merge(ax.s)
+        """
+        import jax.numpy as jnp
+        import numpy as np
+
+        sizes = [a.size for a in self.target_axes]
+        if None in sizes:
+            raise ValueError("Cannot merge axes with undefined sizes.")
+        total_size = int(np.prod(sizes))
+
+        if new_axis.size is not None and new_axis.size != total_size:
+            raise ValueError(
+                f"Topological Violation: Cannot merge axes of sizes {sizes} (total: {total_size}) "
+                f"into '{new_axis.name}' of size {new_axis.size}."
+            )
+
+        final_axis = Axis(new_axis.name, total_size)
+
+        kept_axes = tuple(a for a in self.tensor.topology if a not in self.target_axes)
+        transpose_order = [self.tensor.topology.index(a) for a in kept_axes + self.target_axes]
+
+        transposed_raw = jnp.transpose(self.tensor.unwrap(), transpose_order)
+
+        kept_shape = tuple(a.size if a.size is not None else -1 for a in kept_axes)
+        merged_raw = jnp.reshape(transposed_raw, kept_shape + (total_size,))
+
+        new_topology = kept_axes + (final_axis,)
+        return Tensor(merged_raw, *new_topology)
 
     def unfold(self, window_axis: Axis, step: int = 1) -> 'Tensor':
         spatial_ax = self.target_axes[0]
@@ -713,7 +756,7 @@ class TargetedBundle(NNTargetedBundleStubs):
         results = [TargetedTensor(t, self.target_axes)[key] for t in self.bundle.tensors]
         return Bundle(*results)
 
-    def proj(self, *target_axes: 'Axis', bias: bool = False, tie: Optional[str] = None, init=None) -> 'Bundle':
+    def proj(self, *target_axes: 'Axis', bias: bool = True, tie: Optional[str] = None, init=None) -> 'Bundle':
         return Bundle(*[TargetedTensor(t, self.target_axes).proj(*target_axes, bias=bias, tie=tie, init=init) for t in
                         self.bundle.tensors])
 
@@ -725,6 +768,18 @@ class TargetedBundle(NNTargetedBundleStubs):
 
     def pw(self, func, tie: Optional[str] = None, **kwargs) -> Tuple['Tensor', ...]:
         return tuple(TargetedTensor(t, self.target_axes).pw(func, tie=tie, **kwargs) for t in self.bundle.tensors)
+
+    def merge(self, new_axis: Axis) -> 'Bundle':
+        """
+        Parallel topological flattening across the bundle.
+        e.g., (q & k & v).h.w.merge(ax.s)
+        """
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.merge(new_axis))
+
+        return Bundle(*results)
 
     def unfold(self, window_axis: 'Axis', step: int = 1) -> 'Bundle':
         return Bundle(

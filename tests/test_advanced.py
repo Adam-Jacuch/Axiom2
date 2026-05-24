@@ -921,3 +921,152 @@ def test_explicit_tie_scope_override():
     assert "my_global_bias" in compiler_state.params
     assert len(compiler_state.params) == 1  # They successfully shared the exact same parameter!
     print("Explicit tie overrides passed!\n")
+
+
+# ==========================================
+# 18. TEST: Single Tensor Merging
+# ==========================================
+def test_tensor_merge():
+    print("--- Testing Tensor Axis Merging ---")
+    ax.b = ax("b", 2)
+    ax.h = ax("h", 8)
+    ax.w = ax("w", 8)
+    ax.d = ax("d", 16)
+
+    # 1. Standard Merge
+    x = init.normal(ax.b(2), ax.h(8), ax.w(8), ax.d(16))
+    ax.spatial = ax("spatial", 64)  # 8 * 8 = 64
+
+    merged = x.h.w.merge(ax.spatial)
+
+    # Topology should reflect the merged axis at the end!
+    assert merged.topology == (ax.b(2), ax.d(16), ax.spatial(64))
+    assert merged.unwrap().shape == (2, 16, 64)
+
+    # 2. Strict Size Guard Catch
+    ax.bad_spatial = ax("bad_spatial", 63)
+    with pytest.raises(ValueError, match="Topological Violation"):
+        _ = x.h.w.merge(ax.bad_spatial)
+
+    print("Single Tensor merge passed!\n")
+
+
+# ==========================================
+# 19. TEST: Parallel Bundle Merging
+# ==========================================
+def test_bundle_merge():
+    print("--- Testing Parallel Bundle Merging ---")
+    ax.b = ax("b", 2)
+    ax.heads = ax("heads", 4)
+    ax.seq = ax("seq", 128)
+    ax.head_dim = ax("head_dim", 64)
+
+    # Simulate multi-head attention outputs
+    q = init.normal(ax.b, ax.heads, ax.seq, ax.head_dim)
+    k = init.normal(ax.b, ax.heads, ax.seq, ax.head_dim)
+    v = init.normal(ax.b, ax.heads, ax.seq, ax.head_dim)
+
+    # We want to merge `heads` and `head_dim` into `d_model` (4 * 64 = 256)
+    ax.d_model = ax("d_model", 256)
+
+    # Parallel Merge!
+    merged_q, merged_k, merged_v = (q & k & v).heads.head_dim.merge(ax.d_model)
+
+    # Verify they were all merged correctly
+    for t in (merged_q, merged_k, merged_v):
+        assert t.topology == (ax.b(2), ax.seq(128), ax.d_model(256))
+
+    # Verify infinite chaining still works on merged bundles
+    chained_proj = (q & k & v).heads.head_dim.merge(ax.d_model).d_model.proj(ax("out", 128))
+    for t in chained_proj:
+        assert t.topology == (ax.b(2), ax.seq(128), ax("out", 128))
+
+    print("Parallel Bundle merge passed!\n")
+
+
+# ==========================================
+# 20. TEST: Bundle Stacking (GQA Pattern)
+# ==========================================
+def test_bundle_stacking():
+    print("--- Testing Bundle Stacking (GQA Pattern) ---")
+    ax.b = ax("b", 2)
+    ax.seq = ax("seq", 10)
+    ax.d = ax("d", 64)
+
+    # Simulate a generic input state
+    x = init.normal(ax.b, ax.seq, ax.d)
+
+    # GQA Config
+    kv_heads = 2
+    q_heads = 8
+    head_dim = 64 // (kv_heads + q_heads)  # 64 // 10 = 6 (just for integer testing)
+
+    ax.kvh = ax("kvh", kv_heads)
+    ax.qh = ax("qh", q_heads)
+    ax.h = ax("h", head_dim)
+
+    # 1. Project into Keys and Values
+    k, v = (x & x).d.proj(ax.kvh, ax.h, bias=False)
+
+    # 2. Replicate K/V for the Query Heads via Bundle Stacking!
+    stacked_bundle = ax.stack([k & v for _ in range(q_heads // kv_heads)], ax("qh_group", q_heads // kv_heads))
+
+    assert isinstance(stacked_bundle, Bundle)
+    # The new stack axis should be injected at the front of the topology
+    assert stacked_bundle.tensors[0].topology == (ax("qh_group", 4), ax.b, ax.seq, ax.kvh, ax.h)
+
+    # 3. Merge the parallel stack groups with the KV heads to match the Q heads
+    k_merged, v_merged = stacked_bundle.qh_group.kvh.merge(ax.qh)
+
+    assert k_merged.topology == (ax.b, ax.seq, ax.h, ax.qh(8))
+    print("Bundle stacking passed!\n")
+
+
+# ==========================================
+# 21. TEST: Pure JAX Conversion and Manual VJP
+# ==========================================
+def test_to_jax_and_manual_vjp():
+    print("--- Testing to_jax and Manual VJP ---")
+    ax.b = ax("b", 2)
+    ax.d = ax("d", 4)
+
+    # 1. Define a standard Axiom model
+    def my_net(x):
+        return x.d.proj(ax("out", 8), bias=True).out.gelu()
+
+    model = ax.model(my_net)
+
+    # 2. Initialize it via ghost pass
+    x = init.normal(ax.b, ax.d)
+    _ = model(x)
+
+    # 3. Strip it down to pure JAX!
+    from axiom.compiler import to_jax
+    params, apply_fn = to_jax(model)
+
+    assert isinstance(params, dict)
+    assert "my_net_0/proj_w_0" in params
+
+    # 4. Perform a manual JAX Vector-Jacobian Product (VJP)
+    import jax
+
+    # We want gradients with respect to params and inputs
+    def fwd(p, inputs):
+        return apply_fn(p, inputs)
+
+    # Get the outputs and the backward-pass function
+    primals_out, vjp_fn = jax.vjp(fwd, params, x)
+
+    assert primals_out.topology == (ax.b(2), ax("out", 8))
+
+    # 5. Push a cotangent vector backward!
+    # Cotangents must match the shape of the output
+    cotangent = init.ones(ax.b(2), ax("out", 8))
+
+    grad_params, grad_inputs = vjp_fn(cotangent)
+
+    # Validate the gradients were successfully computed
+    assert "my_net_0/proj_w_0" in grad_params
+    assert grad_inputs.topology == (ax.b(2), ax.d(4))
+
+    print("to_jax and manual VJP passed!\n")
