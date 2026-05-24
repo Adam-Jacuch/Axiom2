@@ -31,26 +31,32 @@ class AxiomModel:
         kwargs = decay_monads(kwargs)
 
         # --- THE CONTEXT SWITCH ---
+        # 1. Snapshot the current trace state
         prev_params = getattr(compiler_state, 'params', {})
+        prev_counter = getattr(compiler_state, 'param_counter', 0)
+        prev_frames = compiler_state.active_frames.copy()
+        prev_calls = compiler_state.func_calls.copy()
+
+        # 2. Inject this model's state
         compiler_state.params = self.params
+        compiler_state.param_counter = 0
+        compiler_state.active_frames.clear()
+        compiler_state.func_calls.clear()
 
-        # Safely reset the scope trackers and counter for a new trace!
-        compiler_state.reset_pass_state()
-
+        # 3. Execute!
         is_uninitialized = not self.is_initialized
         is_global_init = getattr(compiler_state, 'is_initializing', False)
 
         if is_global_init or is_uninitialized:
             # --- THE GHOST PASS ---
             compiler_state.is_initializing = True
-
             res = self.fn(*args, **kwargs)
 
             # Save the newly allocated parameters back into the PyTree
             self.params = compiler_state.params.copy()
             self.is_initialized = True
 
-            # Restore the global state in case we are inside another trace
+            # Restore global init state
             compiler_state.is_initializing = is_global_init
         else:
             # --- PURE XLA EXECUTION ---
@@ -58,6 +64,8 @@ class AxiomModel:
 
         # --- RESTORE CONTEXT ---
         compiler_state.param_counter = prev_counter
+        compiler_state.active_frames = prev_frames
+        compiler_state.func_calls = prev_calls
         compiler_state.params = prev_params
 
         return res
