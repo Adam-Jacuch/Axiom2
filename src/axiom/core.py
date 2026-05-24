@@ -37,35 +37,37 @@ class CompilerState:
         self.func_calls.clear()
 
     def get_scoped_name(self, explicit_name: Optional[str] = None, fallback_prefix: str = "param") -> str:
-        """Resolves global ties (@) vs local execution scopes."""
+        """
+        Resolves scoping logic:
+        1. If tie='@...' -> Global scope.
+        2. If tie='...' -> Local execution scope, force this name.
+        3. If name='...' -> Semantic label in execution scope, auto-append counter.
+        4. No arguments -> Default fallback, auto-append counter.
+        """
         import inspect
 
-        # Global Tie
+        # 1. Global Tie (Ignore scope, ignore counter)
         if explicit_name is not None and explicit_name.startswith('@'):
             return explicit_name[1:]
 
-        # Local Execution Scope Resolution
+        # 2. Local Scope Resolution
         scope_func = "global"
         target_frame = None
-
         stack = inspect.stack()
         alive_frames = {f.frame for f in stack}
 
-        # Lazy Frame Cleanup
-        # We hold the ACTUAL frame object to prevent memory address reuse.
-        # Here, we safely drop any frame that has returned and is no longer in the call stack.
+        # Lazy Cleanup: Prevent memory leaks and address recycling
         dead_frames = [f for f in self.active_frames if f not in alive_frames]
-        for f in dead_frames:
-            del self.active_frames[f]
+        for f in dead_frames: del self.active_frames[f]
 
-        # Walk up the stack and ignore all Axiom library code to find the user's function!
+        # Walk up the stack to find the user's function
         for frame_info in stack:
             if "axiom/" not in frame_info.filename.replace("\\", "/"):
                 scope_func = frame_info.function
                 target_frame = frame_info.frame
                 break
 
-        # Execution Instance Isolation (e.g., gqa_0 vs gqa_1)
+        # Execution Instance Isolation (gqa_0, gqa_1, ...)
         if target_frame is not None:
             if target_frame not in self.active_frames:
                 count = self.func_calls.get(scope_func, 0)
@@ -75,10 +77,12 @@ class CompilerState:
         else:
             scope_id = scope_func
 
-        # Tie assignment
+        # 3. Deterministic Naming & Tying Logic
         if explicit_name:
-            return f"{scope_id}/{explicit_name}"  # Ties within THIS specific function execution
+            # If explicit tie is provided, use it exactly as the identifier
+            return f"{scope_id}/{explicit_name}"
         else:
+            # Otherwise, use the semantic name (or fallback) + deterministic counter
             p_name = f"{scope_id}/{fallback_prefix}_{self.param_counter}"
             self.param_counter += 1
             return p_name
@@ -1026,16 +1030,17 @@ class Tensor(NNTensorStubs):
         """Registers the tensor as a trainable parameter for the AOT compiler."""
         self._is_param = True
 
-        # Tie backward compatibility
-        explicit_name = name
-        if tie is not None:
-            explicit_name = tie if isinstance(tie, str) else tie.name
+        # 'tie' is the strict memory-sharing override.
+        # 'name' is just a semantic label for the fallback prefix!
+        explicit_tie = tie if isinstance(tie, str) else (tie.name if tie else None)
+        fallback = name if name else "param"
 
-        # Let CompilerState handle the heavy lifting!
-        true_name = compiler_state.get_scoped_name(explicit_name=explicit_name, fallback_prefix="param")
+        true_name = compiler_state.get_scoped_name(explicit_name=explicit_tie, fallback_prefix=fallback)
         self._param_name = true_name
 
-        # Unconditional write guarantees eager initialization!
+        # Unconditional Write
+        # This guarantees eager execution ALWAYS collects parameters,
+        # making it perfectly consistent with .bias() and .gate()!
         if true_name not in compiler_state.params:
             compiler_state.params[true_name] = self.unwrap()
 

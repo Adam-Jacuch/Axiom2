@@ -24,8 +24,8 @@ def layer_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> 
     x_norm = diff / (var + eps).sqrt()
 
     tie_obj = Tie(tie) if tie else None
-    gamma = init.ones(*targeted.target_axes).param(tie=tie_obj)
-    beta = init.zeros(*targeted.target_axes).param(tie=tie_obj)
+    gamma = init.ones(*targeted.target_axes).param(name="gamma", tie=tie_obj)
+    beta = init.zeros(*targeted.target_axes).param(name="beta", tie=tie_obj)
 
     return (x_norm * gamma) + beta
 
@@ -38,7 +38,7 @@ def rms_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> Te
     x_norm = x / (var + eps).sqrt()
 
     tie_obj = Tie(tie) if tie else None
-    gamma = init.ones(*targeted.target_axes).param(tie=tie_obj)
+    gamma = init.ones(*targeted.target_axes).param(name="gamma", tie=tie_obj)
 
     return x_norm * gamma
 
