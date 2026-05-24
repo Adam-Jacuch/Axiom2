@@ -847,8 +847,8 @@ def test_dynamic_axiom_nn_routing():
     assert out.topology == (ax.b(2), ax.s(4), ax.d(16))
 
     # Notice the _0 prefix! This proves execution isolation works.
-    assert "test_dynamic_axiom_nn_routing_0/gamma" in compiler_state.params
-    assert "test_dynamic_axiom_nn_routing_0/beta" in compiler_state.params
+    assert "test_dynamic_axiom_nn_routing_0/param_0" in compiler_state.params
+    assert "test_dynamic_axiom_nn_routing_0/param_1" in compiler_state.params
     print("Dynamic Axiom NN routing and parameter allocation passed!\n")
 
 
