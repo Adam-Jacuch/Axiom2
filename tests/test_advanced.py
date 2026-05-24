@@ -1070,3 +1070,54 @@ def test_to_jax_and_manual_vjp():
     assert grad_inputs.topology == (ax.b(2), ax.d(4))
 
     print("to_jax and manual VJP passed!\n")
+
+
+# ==========================================
+# 22. TEST: Topological Splitting
+# ==========================================
+def test_tensor_split():
+    print("--- Testing Tensor Axis Splitting ---")
+    ax.b = ax("b", 2)
+    ax.d = ax("d", 32)
+    x = init.normal(ax.b, ax.d)
+
+    # 1. Split with explicit sizes
+    ax.heads = ax("heads", 4)
+    ax.h_dim = ax("h_dim", 8)
+    split_explicit = x.d.split(ax.heads, ax.h_dim)
+
+    assert split_explicit.topology == (ax.b(2), ax.heads(4), ax.h_dim(8))
+
+    # 2. Split with INFERRED size!
+    ax.heads_inf = ax("heads_inf")  # Notice we pass NO size here!
+    split_inferred = x.d.split(ax.heads_inf, ax.h_dim(8))
+
+    # Axiom should perfectly calculate that 32 // 8 = 4
+    assert split_inferred.topology == (ax.b(2), ax("heads_inf", 4), ax.h_dim(8))
+
+    # 3. Guard: Invalid inference math
+    with pytest.raises(ValueError, match="cleanly divide"):
+        _ = x.d.split(ax("bad_inf"), ax("bad_dim", 7))
+
+    print("Single Tensor split passed!\n")
+
+
+# ==========================================
+# 23. TEST: Parallel Bundle Splitting
+# ==========================================
+def test_bundle_split():
+    print("--- Testing Parallel Bundle Splitting ---")
+    ax.b = ax("b", 2)
+    ax.d = ax("d", 32)
+
+    q = init.normal(ax.b, ax.d)
+    k = init.normal(ax.b, ax.d)
+    v = init.normal(ax.b, ax.d)
+
+    # Split them all in parallel, inferring the head dimension!
+    q_split, k_split, v_split = (q & k & v).d.split(ax("heads", 4), ax("h_dim"))
+
+    for t in (q_split, k_split, v_split):
+        assert t.topology == (ax.b(2), ax("heads", 4), ax("h_dim", 8))
+
+    print("Bundle splitting passed!\n")

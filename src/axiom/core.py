@@ -562,6 +562,59 @@ class TargetedTensor(NNTargetedTensorStubs):
         new_topology = kept_axes + (final_axis,)
         return Tensor(merged_raw, *new_topology)
 
+    def split(self, *new_axes: Axis) -> 'Tensor':
+        """
+        Pure topological splitting.
+        Splits a single targeted axis into multiple new axes, supporting size inference.
+        e.g., x.d.split(ax.heads(4), ax.head_dim)
+        """
+        if len(self.target_axes) != 1:
+            raise ValueError("split() requires exactly one targeted axis. Merge first if splitting multiple.")
+
+        target_ax = self.target_axes[0]
+
+        import jax.numpy as jnp
+
+        known_size = 1
+        unknown_axes = []
+        for a in new_axes:
+            if a.size is None:
+                unknown_axes.append(a)
+            else:
+                known_size *= a.size
+
+        if len(unknown_axes) > 1:
+            raise ValueError("Can only infer the size of one axis during split().")
+
+        final_new_axes = list(new_axes)
+        if unknown_axes:
+            if target_ax.size is None:
+                raise ValueError(
+                    f"Cannot infer size for '{unknown_axes[0].name}' because target axis '{target_ax.name}' has no size.")
+            if target_ax.size % known_size != 0:
+                raise ValueError(f"Cannot cleanly divide {target_ax.size} by {known_size} for axis inference.")
+
+            inferred_size = target_ax.size // known_size
+
+            # Replace the unknown axis with a strictly sized one
+            for i, a in enumerate(final_new_axes):
+                if a.size is None:
+                    final_new_axes[i] = Axis(a.name, inferred_size)
+        else:
+            if target_ax.size is not None and known_size != target_ax.size:
+                raise ValueError(
+                    f"Topological Violation: Cannot split axis of size {target_ax.size} into {known_size}.")
+
+        ax_idx = self.tensor.topology.index(target_ax)
+        raw_shape = self.tensor.unwrap().shape
+
+        new_shape = raw_shape[:ax_idx] + tuple(a.size for a in final_new_axes) + raw_shape[ax_idx + 1:]
+        split_raw = jnp.reshape(self.tensor.unwrap(), new_shape)
+
+        new_topology = self.tensor.topology[:ax_idx] + tuple(final_new_axes) + self.tensor.topology[ax_idx + 1:]
+
+        return Tensor(split_raw, *new_topology)
+
     def unfold(self, window_axis: Axis, step: int = 1) -> 'Tensor':
         spatial_ax = self.target_axes[0]
         out_size = (spatial_ax.size - window_axis.size) // step + 1
@@ -778,6 +831,18 @@ class TargetedBundle(NNTargetedBundleStubs):
         for tensor in self.bundle.tensors:
             t_tensor = TargetedTensor(tensor, self.target_axes)
             results.append(t_tensor.merge(new_axis))
+
+        return Bundle(*results)
+
+    def split(self, *new_axes: Axis) -> 'Bundle':
+        """
+        Parallel topological splitting across the bundle.
+        e.g., (q & k & v).d.split(ax.heads(8), ax.h)
+        """
+        results = []
+        for tensor in self.bundle.tensors:
+            t_tensor = TargetedTensor(tensor, self.target_axes)
+            results.append(t_tensor.split(*new_axes))
 
         return Bundle(*results)
 
