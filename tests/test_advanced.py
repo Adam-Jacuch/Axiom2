@@ -336,8 +336,8 @@ def test_implicit_parameters():
 
     # FIX: Read from compiler_state.params instead of state.params!
     print(f"State Manager Params: {list(compiler_state.params.keys())}")
-    assert "gated_residual_block/gate_0" in compiler_state.params
-    assert "gated_residual_block/bias_1" in compiler_state.params
+    assert "gated_residual_block_0/gate_0" in compiler_state.params
+    assert "gated_residual_block_0/bias_1" in compiler_state.params
     print("Implicit parameters and Invisible Scope passed!\n")
 
 
@@ -634,3 +634,290 @@ def test_sliced_monad_step_slice_commit_is_rejected():
 
     with pytest.raises(ValueError, match="step|contiguous"):
         _ = y[:]
+
+
+# ==========================================
+# 11. TEST: The Universal Dispatcher (Dynamic JAX Routing)
+# ==========================================
+def test_dynamic_jax_reduction():
+    print("--- Testing Dynamic JAX Reduction (var / std) ---")
+    # 'var' and 'std' are NOT explicitly defined in core.py.
+    # They must be dynamically caught by TargetedTensor.__getattr__ and injected with the axis!
+    x = init.normal(ax.b(2), ax.s(4), ax.d(8))
+
+    # Target 's' and calculate variance
+    out_var = x.s.var()
+
+    assert isinstance(out_var, Tensor)
+    # The 's' axis should be collapsed, leaving 'b' and 'd'
+    assert out_var.topology == (ax.b(2), ax.d(8))
+    print("Dynamic JAX reduction passed!\n")
+
+
+def test_dynamic_pure_pointwise_base_tensor():
+    print("--- Testing Pure Pointwise on Base Tensor ---")
+    # Base Tensors should catch pure pointwise math without needing to target an axis
+    x = wrap(jnp.array([-1.0, 0.0, 1.0]), ax.d(3))
+
+    out_exp = x.exp()
+    out_abs = x.abs()
+
+    assert isinstance(out_exp, Tensor)
+    assert out_exp.topology == (ax.d(3),)
+    assert jnp.allclose(out_abs.unwrap(), jnp.array([1.0, 0.0, 1.0]))
+    print("Base tensor dynamic pointwise passed!\n")
+
+
+def test_mathematical_ambiguity_guard():
+    print("--- Testing Mathematical Ambiguity Guard ---")
+    x = init.normal(ax.b(2), ax.d(8))
+
+    # jax.nn.softmax requires an axis. Calling it on the base tensor should crash
+    # with our custom mathematical ambiguity error!
+    with pytest.raises(ValueError, match="Mathematical Ambiguity"):
+        _ = x.softmax()
+
+    # But targeting the axis first should work perfectly
+    safe_out = x.d.softmax()
+    assert safe_out.topology == (ax.b(2), ax.d(8))
+    print("Mathematical Ambiguity guard successfully triggered!\n")
+
+
+# ==========================================
+# 12. TEST: Dynamic Bundle Routing
+# ==========================================
+def test_dynamic_bundle_dispatch():
+    print("--- Testing Dynamic Bundle Dispatch ---")
+    x = init.normal(ax.b(2), ax.d(4))
+    y = init.normal(ax.b(2), ax.d(4))
+
+    # 'square' is a JAX primitive, not explicitly defined in Bundle.
+    # The Bundle Dispatcher should catch it and route it parallel across both!
+    out_x, out_y = (x & y).square()
+
+    assert isinstance(out_x, Tensor)
+    assert isinstance(out_y, Tensor)
+    assert out_x.topology == (ax.b(2), ax.d(4))
+
+    # Reductions via Bundle targeting
+    var_x, var_y = (x & y).d.var()
+    assert var_x.topology == (ax.b(2),)
+    assert var_y.topology == (ax.b(2),)
+    print("Dynamic Bundle Dispatch passed!\n")
+
+
+# ==========================================
+# 13. TEST: Dynamic Axiom NN Module Routing
+# ==========================================
+def test_dynamic_axiom_nn_routing():
+    print("--- Testing Dynamic Axiom NN Routing ---")
+    compiler_state.params.clear()
+    compiler_state.param_counter = 0
+
+    x = init.normal(ax.b(2), ax.s(4), ax.d(16))
+
+    # layer_norm is defined in axiom.nn and decorated with @axiom_nn_op
+    # TargetedTensor should catch it, pass the WHOLE TargetedTensor object to it,
+    # and properly initialize the gamma/beta weights via the Ghost Pass.
+    out = x.d.layer_norm()
+
+    assert out.topology == (ax.b(2), ax.s(4), ax.d(16))
+    assert "test_dynamic_axiom_nn_routing/gamma_0" in compiler_state.params
+    assert "test_dynamic_axiom_nn_routing/beta_1" in compiler_state.params
+    print("Dynamic Axiom NN routing and parameter allocation passed!\n")
+
+
+def test_missing_attribute_error():
+    print("--- Testing Missing Attribute Fallback ---")
+    x = init.normal(ax.d(4))
+
+    # Asking for an axis that doesn't exist or a typo'd function
+    with pytest.raises(AttributeError, match="Tensor has no axis, NN function, or JAX primitive 'made_up_func'"):
+        _ = x.made_up_func()
+
+    with pytest.raises(AttributeError, match="Targeted axis, NN function, or JAX primitive 'fake_axis' not found"):
+        _ = x.d.fake_axis()
+
+    print("Clean AttributeErrors passed!\n")
+
+
+# ==========================================
+# 14. TEST: 1D Spatial Convolution (pad -> unfold -> proj)
+# ==========================================
+def test_1d_convolution():
+    print("--- Testing 1D Convolution Pipeline ---")
+    ax.s = ax("s", 5)  # Spatial Sequence
+    ax.w = ax("w", 3)  # Window/Kernel Size
+    ax.d = ax("d", 4)  # Input Features
+    ax.out_d = ax("out_d", 8)  # Output Features
+
+    # Input: [batch=2, seq=5, features=4]
+    x = init.normal(ax.b(2), ax.s(5), ax.d(4))
+
+    # 1. Pad sequence: 1 on left, 1 on right (Maintains spatial size after unfold)
+    padded = x.s.pad((1, 1))
+    assert padded.topology == (ax.b(2), ax.s(7), ax.d(4))
+
+    # 2. Unfold: Slide window of size 3. Out size: (7 - 3)//1 + 1 = 5
+    unfolded = padded.s.unfold(ax.w(3), step=1)
+
+    # Topology should now contain the window axis!
+    assert unfolded.topology == (ax.b(2), ax.s(5), ax.w(3), ax.d(4))
+
+    # 3. Project: Contract BOTH window and input features into output features
+    # This is exactly how a convolution kernel works under the hood!
+    out = unfolded.w.d.proj(ax.out_d(8), bias=True)
+
+    assert out.topology == (ax.b(2), ax.s(5), ax.out_d(8))
+    print("1D Convolution pipeline passed!\n")
+
+
+# ==========================================
+# 15. TEST: Coordinate Masking (Causal Attention Grid)
+# ==========================================
+def test_coordinate_masking():
+    print("--- Testing Coordinate Masking (Causal TriL) ---")
+    ax.q = ax("q", 4)
+    ax.k = ax("k", 4)
+
+    # Simulate an unmasked attention matrix [q=4, k=4]
+    attn = init.ones(ax.q(4), ax.k(4))
+
+    # Mask out the upper triangle natively using index logic!
+    # If q_index < k_index, mask it to -1e9
+    causal_attn = attn.q.k.mask(lambda q_idx, k_idx: q_idx < k_idx, fill=-1e9)
+
+    raw = causal_attn.unwrap()
+
+    assert raw[0, 1] == -1e9  # Upper triangle is masked
+    assert raw[1, 0] == 1.0  # Lower triangle is untouched
+    assert causal_attn.topology == (ax.q(4), ax.k(4))
+    print("Coordinate masking passed!\n")
+
+
+# ==========================================
+# 16. TEST: Value Masking (vmask)
+# ==========================================
+def test_value_masking():
+    print("--- Testing Value Masking (vmask) ---")
+    ax.d = ax("d", 4)
+    x = wrap(jnp.array([0.1, 0.9, 0.4, 0.8]), ax.d)
+
+    # Drop values below 0.5 to zero (ReLU-like behavior)
+    dropped = x.vmask(lambda arr: arr < 0.5, fill=0.0)
+
+    assert jnp.allclose(dropped.unwrap(), jnp.array([0.0, 0.9, 0.0, 0.8]))
+    assert dropped.topology == (ax.d(4),)
+    print("Value masking passed!\n")
+
+
+# ==========================================
+# 17. TEST: Explicit Tie Scope Overrides
+# ==========================================
+def test_explicit_tie_scope_override():
+    print("--- Testing Explicit Tie Scope Override ---")
+    compiler_state.params.clear()
+    compiler_state.param_counter = 0
+
+    ax.d = ax("d", 4)
+    x = init.ones(ax.d)
+
+    # Two separate functions simulating two different model blocks
+    def block_a(t): return t.d.bias(tie="@my_global_bias")
+
+    def block_b(t): return t.d.bias(tie="@my_global_bias")
+
+    _ = block_a(x)
+    _ = block_b(x)
+
+    # Because they used a global tie, they should NOT register under block_a or block_b
+    assert "my_global_bias" in compiler_state.params
+    assert len(compiler_state.params) == 1  # They successfully shared the exact same parameter!
+    print("Explicit tie overrides passed!\n")
+
+
+def test_dynamic_axiom_nn_routing():
+    print("--- Testing Dynamic Axiom NN Routing ---")
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    x = init.normal(ax.b(2), ax.s(4), ax.d(16))
+    out = x.d.layer_norm()
+
+    assert out.topology == (ax.b(2), ax.s(4), ax.d(16))
+
+    # Notice the _0 prefix! This proves execution isolation works.
+    assert "test_dynamic_axiom_nn_routing_0/gamma" in compiler_state.params
+    assert "test_dynamic_axiom_nn_routing_0/beta" in compiler_state.params
+    print("Dynamic Axiom NN routing and parameter allocation passed!\n")
+
+
+def test_1d_convolution():
+    print("--- Testing 1D Convolution Pipeline ---")
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    ax.s = ax("s", 5)  # Spatial Sequence
+    ax.w = ax("w", 3)  # Window/Kernel Size
+    ax.d = ax("d", 4)  # Input Features
+    ax.out_d = ax("out_d", 8)  # Output Features
+
+    # Input: [batch=2, seq=5, features=4]
+    x = init.normal(ax.b(2), ax.s(5), ax.d(4))
+
+    # 1. Pad sequence: 1 on left, 1 on right (Maintains spatial size after unfold)
+    padded = x.s.pad((1, 1))
+    assert padded.topology == (ax.b(2), ax.s(7), ax.d(4))
+
+    # 2. Unfold: Slide window of size 3. Out size: (7 - 3)//1 + 1 = 5
+    unfolded = padded.s.unfold(ax.w(3), step=1)
+
+    # Topology should now contain the window axis!
+    assert unfolded.topology == (ax.b(2), ax.s(5), ax.w(3), ax.d(4))
+
+    # 3. Project: Contract BOTH window and input features into output features!
+    out = unfolded.w.d.proj(ax.out_d(8), bias=True)
+
+    assert out.topology == (ax.b(2), ax.s(5), ax.out_d(8))
+    assert "test_1d_convolution_0/proj_w_0" in compiler_state.params
+    print("1D Convolution pipeline passed!\n")
+
+
+def test_coordinate_masking():
+    print("--- Testing Coordinate Masking (Causal TriL) ---")
+    ax.q = ax("q", 4)
+    ax.k = ax("k", 4)
+
+    attn = init.ones(ax.q(4), ax.k(4))
+
+    # Mask out the upper triangle natively using index logic!
+    # If q_index < k_index, mask it to -1e9
+    causal_attn = attn.q.k.mask(lambda q_idx, k_idx: q_idx < k_idx, fill=-1e9)
+    raw = causal_attn.unwrap()
+
+    assert raw[0, 1] == -1e9  # Upper triangle is masked
+    assert raw[1, 0] == 1.0  # Lower triangle is untouched
+    assert causal_attn.topology == (ax.q(4), ax.k(4))
+    print("Coordinate masking passed!\n")
+
+
+def test_explicit_tie_scope_override():
+    print("--- Testing Explicit Tie Scope Override ---")
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    ax.d = ax("d", 4)
+    x = init.ones(ax.d)
+
+    # Two separate functions simulating two different model blocks
+    def block_a(t): return t.d.bias(tie="@my_global_bias")
+
+    def block_b(t): return t.d.bias(tie="@my_global_bias")
+
+    _ = block_a(x)
+    _ = block_b(x)
+
+    # Because they used a global tie, they should NOT register under block_a or block_b
+    assert "my_global_bias" in compiler_state.params
+    assert len(compiler_state.params) == 1  # They successfully shared the exact same parameter!
+    print("Explicit tie overrides passed!\n")

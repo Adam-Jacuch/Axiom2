@@ -34,11 +34,9 @@ class AxiomModel:
         prev_params = getattr(compiler_state, 'params', {})
         compiler_state.params = self.params
 
-        # Reset the counter to guarantee deterministic name alignment
-        prev_counter = getattr(compiler_state, 'param_counter', 0)
-        compiler_state.param_counter = 0
+        # Safely reset the scope trackers and counter for a new trace!
+        compiler_state.reset_pass_state()
 
-        # FIX: Auto-detect if we need a local Eager Ghost Pass!
         is_uninitialized = not self.is_initialized
         is_global_init = getattr(compiler_state, 'is_initializing', False)
 
@@ -157,8 +155,8 @@ def _trigger_ghost_pass(fn, *args, **kwargs):
     models = _get_models(args) + _get_models(kwargs)
 
     if any(not m.is_initialized for m in models):
-        # Run exactly once in eager initialization mode
         compiler_state.is_initializing = True
+        compiler_state.reset_pass_state()
         fn(*args, **kwargs)
         compiler_state.is_initializing = False
 

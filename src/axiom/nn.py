@@ -1,14 +1,12 @@
 import jax
 import jax.numpy as jnp
-from .core import TargetedTensor, Tensor, ax, Tie
+from .core import TargetedTensor, Tensor, Tie
 from . import init
-
 
 def axiom_nn_op(func):
     """Decorator to mark a function as an Axiom native NN module."""
     func._is_axiom_nn = True
     return func
-
 
 # ==========================================
 # 1. STATEFUL NORMALIZATION LAYERS
@@ -16,19 +14,14 @@ def axiom_nn_op(func):
 
 @axiom_nn_op
 def layer_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> Tensor:
-    """Standard Layer Normalization with Learnable Gamma and Beta."""
     x = targeted.tensor
     mean = targeted.mean()
 
-    # 1. Use pure Axiom native broadcasting for the difference!
     diff = x - mean
-    sq_diff = diff.pw(jnp.square)
+    sq_diff = diff.square() # <-- Notice the native dynamic call!
 
-    # 2. Re-target the squared difference to reduce over the correct axes programmatically
     var = TargetedTensor(sq_diff, targeted.target_axes).mean()
-
-    # 3. Normalize
-    x_norm = diff / (var + eps).pw(jnp.sqrt)
+    x_norm = diff / (var + eps).sqrt()
 
     tie_obj = Tie(tie) if tie else None
     gamma = init.ones(*targeted.target_axes).param(name="gamma", tie=tie_obj)
@@ -39,17 +32,10 @@ def layer_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> 
 
 @axiom_nn_op
 def rms_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> Tensor:
-    """Root Mean Square Normalization (Used in Llama, Hawk, Mamba)."""
     x = targeted.tensor
-
-    # 1. Square the tensor (Returns a pure Tensor)
-    squared = targeted.pw(jnp.square)
-
-    # 2. Re-target the squared tensor programmatically so it knows what to reduce!
+    squared = targeted.square()
     var = TargetedTensor(squared, targeted.target_axes).mean()
-
-    # 3. Pure tensors natively support .pw(), so this works perfectly
-    x_norm = x / (var + eps).pw(jnp.sqrt)
+    x_norm = x / (var + eps).sqrt()
 
     tie_obj = Tie(tie) if tie else None
     gamma = init.ones(*targeted.target_axes).param(name="gamma", tie=tie_obj)
@@ -62,29 +48,22 @@ def rms_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> Te
 # ==========================================
 
 def mse_loss(preds: Tensor, targets: Tensor) -> Tensor:
-    """Mean Squared Error (L2). Automatically broadcasts topologies."""
-    return (preds - targets).pw(jnp.square)
+    return (preds - targets).square()
 
 
 def l1_loss(preds: Tensor, targets: Tensor) -> Tensor:
-    """Mean Absolute Error (L1). Automatically broadcasts topologies."""
-    return (preds - targets).pw(jnp.abs)
+    return (preds - targets).abs()
 
 
 def huber_loss(preds: Tensor, targets: Tensor, delta: float = 1.0) -> Tensor:
-    """
-    Smooth L1 Loss (Huber).
-    Transitions from L2 (MSE) to L1 (MAE) for large errors to prevent exploding gradients.
-    """
-    diff = (preds - targets).pw(jnp.abs)
-    # Use JAX's where condition to smoothly transition
+    diff = (preds - targets).abs()
+    # Still requires .pw() for custom lambda logic, which is perfect!
     return diff.pw(lambda x: jnp.where(x < delta, 0.5 * jnp.square(x), delta * (x - 0.5 * delta)))
 
 
 def bce_with_logits(logits: Tensor, targets: Tensor) -> Tensor:
-    """Numerically stable Binary Cross Entropy with Logits."""
-    max_val = logits.pw(lambda x: jnp.clip(x, 0, None))
-    log_weight = logits.pw(jnp.abs).pw(lambda x: jnp.log(1 + jnp.exp(-x)))
+    max_val = logits.clip(0, None)
+    log_weight = logits.abs().pw(lambda x: jnp.log(1 + jnp.exp(-x)))
     return max_val - (logits * targets) + log_weight
 
 

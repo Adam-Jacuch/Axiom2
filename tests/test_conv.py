@@ -1,12 +1,11 @@
 import pytest
 import jax.numpy as jnp
-from axiom import ax, Tensor, wrap, axiom_jit
+from axiom import ax, Tensor, wrap
 
 
 def test_linear_projection_with_bias():
     """Tests that biases are correctly initialized and broadcasted."""
 
-    @axiom_jit
     def linear_layer(x: Tensor):
         # Project from 16 to 32, with a bias
         return x.in_d.proj(ax.out_d(32), bias=True)
@@ -45,7 +44,6 @@ def test_sequence_unfold():
 def test_native_1d_convolution():
     """Combines unfold and proj to perform a 1D Convolution over a sequence."""
 
-    @axiom_jit
     def conv1d_layer(x: Tensor):
         # 1. Unfold the sequence
         windows = x.seq.unfold(ax.kernel(3))
