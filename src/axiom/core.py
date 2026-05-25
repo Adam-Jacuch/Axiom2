@@ -789,6 +789,19 @@ class TargetedTensor(NNTargetedTensorStubs):
 
         return result
 
+    def __iter__(self):
+        """Allows Pythonic unpacking of a targeted axis: x1, x2 = x.split_ax"""
+        if len(self.target_axes) > 1:
+            raise ValueError("Can only unpack a single targeted axis at a time.")
+
+        target_ax = self.target_axes[0]
+
+        if target_ax.size is None:
+            raise ValueError(f"Cannot unpack axis '{target_ax.name}' because its size is unknown.")
+
+        for i in range(target_ax.size):
+            yield self[i]
+
     def __getitem__(self, key: Any) -> Any:
         if key == slice(None): return self.tensor
         if hasattr(key, "chunk_tensor"): key = key.chunk_tensor
@@ -971,6 +984,19 @@ class TargetedBundle(NNTargetedBundleStubs):
     def vmask(self, func, fill: float = 0.0) -> Tuple['Tensor', ...]:
         bool_mask = func(*[t.unwrap() for t in self.bundle.tensors])
         return tuple(Tensor(jnp.where(bool_mask, fill, t.unwrap()), *t.topology) for t in self.bundle.tensors)
+
+    def __iter__(self):
+        """Allows Pythonic unpacking across a bundle: (q & k).heads"""
+        if len(self.target_axes) > 1:
+            raise ValueError("Can only unpack a single targeted axis at a time.")
+
+        target_ax = self.target_axes[0]
+
+        if target_ax.size is None:
+            raise ValueError(f"Cannot unpack axis '{target_ax.name}' because its size is unknown.")
+
+        for i in range(target_ax.size):
+            yield self[i]
 
 
 class Bundle:

@@ -1121,3 +1121,80 @@ def test_bundle_split():
         assert t.topology == (ax.b(2), ax("heads", 4), ax("h_dim", 8))
 
     print("Bundle splitting passed!\n")
+
+
+# ==========================================
+# 24. TEST: init.arange primitive
+# ==========================================
+def test_init_arange():
+    print("--- Testing init.arange ---")
+
+    # 1. Standard count
+    # Use ax("s") instead of ax.s to prevent state bleed from previous tests!
+    t = init.arange(10, ax("s"))
+    assert t.topology == (ax("s", 10),)
+    assert t.unwrap()[9] == 9
+
+    # 2. Stepped count with strict axis
+    # Here we explicitly declare the sized axis locally
+    strict_ax = ax("hd", 5)
+    t_step = init.arange(0, 10, 2, strict_ax)
+    assert t_step.topology == (strict_ax,)
+    assert t_step.unwrap()[4] == 8
+
+    print("init.arange passed!\n")
+
+
+# ==========================================
+# 24. TEST: Targeted Tensor Unpacking
+# ==========================================
+def test_tensor_unpacking():
+    print("--- Testing Targeted Tensor Unpacking ---")
+
+    # Create a simple predictable array: shape (2, 3)
+    raw = jnp.array([[1., 2., 3.],
+                     [4., 5., 6.]])
+    x = Tensor(raw, ax.b(2), ax.s(3))
+
+    # Pythonic unpacking across the sequence axis!
+    x0, x1, x2 = x.s
+
+    # 1. Topological Safety: The 's' axis must be completely dropped
+    expected_top = (ax.b(2),)
+    assert x0.topology == expected_top
+    assert x1.topology == expected_top
+    assert x2.topology == expected_top
+
+    # 2. Mathematical Precision
+    assert jnp.allclose(x0.unwrap(), jnp.array([1., 4.]))
+    assert jnp.allclose(x1.unwrap(), jnp.array([2., 5.]))
+    assert jnp.allclose(x2.unwrap(), jnp.array([3., 6.]))
+
+    print("Targeted Tensor unpacking passed!\n")
+
+
+# ==========================================
+# 25. TEST: Parallel Bundle Unpacking
+# ==========================================
+def test_bundle_unpacking():
+    print("--- Testing Parallel Bundle Unpacking ---")
+
+    # Create mock Query and Key matrices
+    q = init.ones(ax.b(2), ax.h(2), ax.d(4))
+    k = init.zeros(ax.b(2), ax.h(2), ax.d(4))
+
+    # Pythonic parallel unpacking across the head axis!
+    (q0, k0), (q1, k1) = (q & k).h
+
+    # 1. Topological Safety: The 'h' axis must be dropped for all tensors
+    expected_top = (ax.b(2), ax.d(4))
+    assert q0.topology == expected_top
+    assert k0.topology == expected_top
+    assert q1.topology == expected_top
+    assert k1.topology == expected_top
+
+    # 2. Mathematical Precision
+    assert jnp.allclose(q0.unwrap(), jnp.ones((2, 4)))
+    assert jnp.allclose(k1.unwrap(), jnp.zeros((2, 4)))
+
+    print("Parallel Bundle unpacking passed!\n")
