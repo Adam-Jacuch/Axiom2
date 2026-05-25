@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from .core import wrap, Axis  # Import Axis for strict routing
+from .core import wrap, Axis, Tensor  # Import Axis for strict routing
 
 def _resolve_axes(axes, like):
     """Helper to extract topology from a 'like' tensor or targeted tensor."""
@@ -62,3 +62,34 @@ normal = Initializer(lambda k, s, **kw: jax.random.normal(k, s))
 uniform = Initializer(lambda k, s, **kw: jax.random.uniform(k, s))
 xavier = Initializer(lambda k, s, fan_in=1, fan_out=1, **kw: jax.random.normal(k, s) * jnp.sqrt(2.0 / (fan_in + fan_out)))
 he = Initializer(lambda k, s, fan_in=1, **kw: jax.random.normal(k, s) * jnp.sqrt(2.0 / fan_in))
+
+
+def arange(*args) -> Tensor:
+    """
+    Axiom wrapper for jnp.arange.
+    The final argument MUST be the target Axis.
+
+    Usage:
+        init.arange(10, ax.s)
+        init.arange(0, 10, 2, ax.h_dim)
+    """
+    if not args or not isinstance(args[-1], Axis):
+        raise ValueError("The last argument to init.arange must be an Axiom Axis.")
+
+    target_ax = args[-1]
+    jnp_args = args[:-1]
+
+    # Generate the raw JAX array
+    raw_array = jnp.arange(*jnp_args)
+
+    # Safety Check: Did the generated array match the expected axis size?
+    if target_ax.size is not None and target_ax.size != raw_array.size:
+        raise ValueError(
+            f"init.arange produced {raw_array.size} elements, but "
+            f"axis '{target_ax.name}' expects {target_ax.size} elements."
+        )
+
+    # If the user passed an unsized axis, infer it dynamically!
+    final_ax = target_ax(raw_array.size) if target_ax.size is None else target_ax
+
+    return Tensor(raw_array, final_ax)
