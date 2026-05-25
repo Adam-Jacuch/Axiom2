@@ -165,6 +165,11 @@ class _AxisNamespace:
         from .compiler import apply_updates
         return apply_updates
 
+    @property
+    def to_jax(self):
+        from .compiler import to_jax
+        return to_jax
+
     def stack(self, items: list[Any], new_axis: 'Axis') -> Any:
         if not items:
             raise ValueError("Cannot stack an empty list.")
