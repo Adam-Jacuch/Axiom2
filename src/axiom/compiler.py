@@ -278,13 +278,31 @@ def apply_updates(model: AxiomModel, grads: Any, optimizer: Any, opt_state: Any)
     return new_model, new_opt_state
 
 
-def to_jax(model: AxiomModel):
+def to_jax(model: 'AxiomModel', *init_axes: 'Axis'):
     """
     Converts an AxiomModel into a pure JAX (params, apply_fn) paradigm.
-    This allows for fine-grained manual control (like jax.vjp, custom gradients, etc.)
+    If init_axes are provided, it automatically initializes the model weights.
     """
+    # --- NEW: Auto-Initialization ---
+    if init_axes and not model.is_initialized:
+        import jax.numpy as jnp
+        from .core import Tensor, Axis
+
+        shape = []
+        for a in init_axes:
+            if not isinstance(a, Axis) or a.size is None:
+                raise ValueError(f"Auto-initialization requires strictly sized Axes, got: {a}")
+            shape.append(a.size)
+
+        # Synthesize a dummy tensor and trigger the Ghost Pass internally!
+        dummy_input = Tensor(jnp.zeros(shape), *init_axes)
+        _ = model(dummy_input)
+
     if not model.is_initialized:
-        raise ValueError("AxiomModel must be initialized (run an eager forward pass) before converting to pure JAX.")
+        raise ValueError(
+            "AxiomModel must be initialized. Either run an eager forward pass first, "
+            "or pass input axes directly: ax.to_jax(model, ax.b(1), ax.d(32))"
+        )
 
     # The parameters are already a flat dictionary of raw jax.Arrays!
     params = model.params.copy()
