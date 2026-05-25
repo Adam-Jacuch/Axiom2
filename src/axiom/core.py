@@ -651,7 +651,10 @@ class TargetedTensor(NNTargetedTensorStubs):
 
         return Tensor(unfolded_raw, *new_topology)
 
-    def scan(self, func, init: 'Tensor') -> Tuple['Tensor', 'Tensor']:
+    def scan(self, func, init=None, associative: bool = False) -> Any:
+        import jax
+        import jax.numpy as jnp
+
         scan_ax = self.target_axes[0]
         ax_idx = self.tensor.topology.index(scan_ax)
 
@@ -660,13 +663,27 @@ class TargetedTensor(NNTargetedTensorStubs):
         xs_transposed = jnp.transpose(self.tensor.unwrap(), perm)
         xt_topology = tuple(a for a in self.tensor.topology if a != scan_ax)
 
-        def wrapped_func(raw_carry, raw_xt):
-            new_carry, out_y = func(Tensor(raw_carry, *init.topology), Tensor(raw_xt, *xt_topology))
-            return new_carry.unwrap(), out_y.unwrap()
+        if associative:
+            def wrapped_assoc(raw_left, raw_right):
+                left_t = Tensor(raw_left, *xt_topology)
+                right_t = Tensor(raw_right, *xt_topology)
+                out = func(left_t, right_t)
+                return out.unwrap()
 
-        final_carry_raw, y_seq_raw = jax.lax.scan(wrapped_func, init.unwrap(), xs_transposed)
-        return Tensor(final_carry_raw, *init.topology), Tensor(jnp.transpose(y_seq_raw, inv_perm),
-                                                               *self.tensor.topology)
+            out_raw = jax.lax.associative_scan(wrapped_assoc, xs_transposed)
+            return Tensor(jnp.transpose(out_raw, inv_perm), *self.tensor.topology)
+
+        else:
+            if init is None:
+                raise ValueError("Sequential scan requires an 'init' state. Or use associative=True.")
+
+            def wrapped_func(raw_carry, raw_xt):
+                new_carry, out_y = func(Tensor(raw_carry, *init.topology), Tensor(raw_xt, *xt_topology))
+                return new_carry.unwrap(), out_y.unwrap()
+
+            final_carry_raw, y_seq_raw = jax.lax.scan(wrapped_func, init.unwrap(), xs_transposed)
+            return Tensor(final_carry_raw, *init.topology), Tensor(jnp.transpose(y_seq_raw, inv_perm),
+                                                                   *self.tensor.topology)
 
     def sample(self, temp: float = 1.0) -> 'Tensor':
         from .state import state
@@ -869,7 +886,10 @@ class TargetedBundle(NNTargetedBundleStubs):
         return Bundle(
             *[TargetedTensor(t, self.target_axes).unfold(window_axis, step=step) for t in self.bundle.tensors])
 
-    def assoc_scan(self, func) -> Tuple['Tensor', ...]:
+    def scan(self, func, init=None, associative: bool = False) -> Any:
+        import jax
+        import jax.numpy as jnp
+
         scan_ax = self.target_axes[0]
         raw_elems, inv_perms, inner_topologies = [], [], []
 
@@ -880,21 +900,50 @@ class TargetedBundle(NNTargetedBundleStubs):
             raw_elems.append(jnp.transpose(tensor.unwrap(), perm))
             inner_topologies.append(tuple(a for a in tensor.topology if a != scan_ax))
 
-        def wrapped_func(raw_left, raw_right):
-            left_tensors, right_tensors, chunk_ax = [], [], None
-            for r_l, r_r, top in zip(raw_left, raw_right, inner_topologies):
-                current_top = top
-                if hasattr(r_l, 'shape') and len(r_l.shape) == len(top) + 1:
-                    if chunk_ax is None: chunk_ax = Axis("_chunk", r_l.shape[0])
-                    current_top = (chunk_ax,) + top
-                left_tensors.append(Tensor(r_l, *current_top))
-                right_tensors.append(Tensor(r_r, *current_top))
+        if associative:
+            def wrapped_assoc(raw_left, raw_right):
+                left_tensors, right_tensors, chunk_ax = [], [], None
+                for r_l, r_r, top in zip(raw_left, raw_right, inner_topologies):
+                    current_top = top
+                    if hasattr(r_l, 'shape') and len(r_l.shape) == len(top) + 1:
+                        if chunk_ax is None: chunk_ax = Axis("_chunk", r_l.shape[0])
+                        current_top = (chunk_ax,) + top
+                    left_tensors.append(Tensor(r_l, *current_top))
+                    right_tensors.append(Tensor(r_r, *current_top))
 
-            return tuple(out.unwrap() for out in func(tuple(left_tensors), tuple(right_tensors)))
+                out_tuple = func(tuple(left_tensors), tuple(right_tensors))
+                return tuple(out.unwrap() for out in out_tuple)
 
-        out_raw_elems = jax.lax.associative_scan(wrapped_func, tuple(raw_elems))
-        return tuple(Tensor(jnp.transpose(raw_out, inv_perm), *t.topology) for raw_out, inv_perm, t in
-                     zip(out_raw_elems, inv_perms, self.bundle.tensors))
+            out_raw_elems = jax.lax.associative_scan(wrapped_assoc, tuple(raw_elems))
+            return tuple(Tensor(jnp.transpose(raw_out, inv_perm), *t.topology) for raw_out, inv_perm, t in
+                         zip(out_raw_elems, inv_perms, self.bundle.tensors))
+
+        else:
+            if init is None:
+                raise ValueError("Sequential scan requires 'init' state(s). Or use associative=True.")
+
+            init_tensors = init.tensors if hasattr(init, 'tensors') else init
+            init_raws = tuple(t.unwrap() for t in init_tensors)
+            init_tops = tuple(t.topology for t in init_tensors)
+
+            def wrapped_func(raw_carry_tuple, raw_xt_tuple):
+                carry_tensors = tuple(Tensor(r, *top) for r, top in zip(raw_carry_tuple, init_tops))
+                xt_tensors = tuple(Tensor(r, *top) for r, top in zip(raw_xt_tuple, inner_topologies))
+
+                new_carry, out_y = func(Bundle(*carry_tensors), Bundle(*xt_tensors))
+
+                new_carry_tensors = new_carry.tensors if hasattr(new_carry, 'tensors') else new_carry
+                out_y_tensors = out_y.tensors if hasattr(out_y, 'tensors') else out_y
+
+                return tuple(t.unwrap() for t in new_carry_tensors), tuple(t.unwrap() for t in out_y_tensors)
+
+            final_carry_raw, y_seq_raw = jax.lax.scan(wrapped_func, init_raws, tuple(raw_elems))
+
+            final_carry = Bundle(*[Tensor(r, *top) for r, top in zip(final_carry_raw, init_tops)])
+            y_seq = Bundle(*[Tensor(jnp.transpose(r, inv_perm), *t.topology) for r, inv_perm, t in
+                             zip(y_seq_raw, inv_perms, self.bundle.tensors)])
+
+            return final_carry, y_seq
 
     def rename(self, *new_axes: Axis) -> Tuple['Tensor', ...]:
         if len(new_axes) == 1: new_axes = new_axes * len(self.bundle.tensors)
@@ -989,7 +1038,7 @@ class Bundle:
     def max(self) -> 'Tensor':
         return self.maximum()
 
-    def apply_n(self, func: callable, times: int) -> 'Bundle':
+    def repeat(self, func: callable, times: int) -> 'Bundle':
         import jax.lax as lax
 
         def _scan_body(carry_raw_tuple, _):
@@ -999,7 +1048,7 @@ class Bundle:
             out_raw_tuple = []
             for in_t, out_t in zip(self.tensors, out_bundle.tensors):
                 if in_t.topology != out_t.topology:
-                    raise ValueError("apply_n requires matched topologies for XLA.")
+                    raise ValueError("repeat requires matched topologies for XLA.")
                 out_raw_tuple.append(out_t.unwrap())
             return tuple(out_raw_tuple), None
 
@@ -1060,7 +1109,7 @@ class Tensor(NNTensorStubs):
     def maximum(self, other) -> 'Tensor':
         return self._broadcast_op(other, jnp.maximum)
 
-    def apply_n(self, func: callable, times: int) -> 'Tensor':
+    def repeat(self, func: callable, times: int) -> 'Tensor':
         import jax.lax as lax
         def _scan_body(carry_raw, _):
             out_tensor = func(Tensor(carry_raw, *self.topology))

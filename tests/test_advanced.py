@@ -245,7 +245,7 @@ def test_tensor_recursion():
 
     # Apply the block 8 times recursively
     # In XLA, this is a single 'scan' loop
-    final_x = x.apply_n(weight_tied_block, times=8)
+    final_x = x.repeat(weight_tied_block, times=8)
 
     print(f"Input: {x.topology}")
     print(f"Output after 8 recursive steps: {final_x.topology}\n")
@@ -277,7 +277,7 @@ def test_bundle_recursion():
         return next_x & next_h
 
     # Carry both (x & h) through 10 iterations
-    out_x, out_h = (x & h).apply_n(rnn_step, times=10)
+    out_x, out_h = (x & h).repeat(rnn_step, times=10)
 
     print(f"Final x: {out_x.topology}")
     print(f"Final h: {out_h.topology}\n")

@@ -6,7 +6,7 @@ from axiom import nn
 EXPLICIT_OVERRIDES = {
     'sum', 'mean', 'max', 'min', 'join', 'rename', 'unfold', 'pad', 'scan',
     'sample', 'mask', 'vmask', 'proj', 'bias', 'gate', 'pw', 'item', 'unwrap',
-    'param', 'stop_grad', 'minimum', 'maximum', 'apply_n', 'tensor', 'bundle',
+    'param', 'stop_grad', 'minimum', 'maximum', 'repeat', 'tensor', 'bundle',
     'target_axes', 'merge', 'split'
 }
 
