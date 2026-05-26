@@ -498,7 +498,23 @@ class TargetedTensor(NNTargetedTensorStubs):
     # --- TOPOLOGICAL MUTATORS & PARAMETER ALLOCATORS (The Explicit overrides) ---
 
     def proj(self, *target_axes: 'Axis', bias: bool = True, tie: Optional[str] = None, init=None) -> 'Tensor':
-        if not target_axes: target_axes = self.target_axes
+        if not target_axes:
+            target_axes = self.target_axes
+        else:
+            # Auto-infer missing sizes from existing topology
+            resolved_axes = []
+            for tgt_ax in target_axes:
+                if tgt_ax.size is None:
+                    # Look for it in the current tensor's topology
+                    for current_ax in self.tensor.topology:
+                        if current_ax.name == tgt_ax.name:
+                            resolved_axes.append(current_ax)
+                            break
+                    else:
+                        raise ValueError(f"Cannot project into '{tgt_ax.name}' without a size.")
+                else:
+                    resolved_axes.append(tgt_ax)
+            target_axes = tuple(resolved_axes)
 
         import numpy as np
         from .state import state
