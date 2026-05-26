@@ -1154,6 +1154,12 @@ class Bundle:
     def max(self) -> 'Tensor':
         return self.maximum()
 
+    def mean(self) -> 'Bundle':
+        return Bundle(*[t.mean() for t in self.tensors])
+
+    def sum(self) -> 'Bundle':
+        return Bundle(*[t.sum() for t in self.tensors])
+
     def repeat(self, func: callable, times: int) -> 'Bundle':
         """Executes a function multiple times over a bundle using tied parameters."""
         import jax.lax as lax
@@ -1239,6 +1245,14 @@ class Tensor(NNTensorStubs):
 
     def maximum(self, other) -> 'Tensor':
         return self._broadcast_op(other, jnp.maximum)
+
+    def mean(self) -> 'Tensor':
+        import jax.numpy as jnp
+        return Tensor(jnp.mean(self.unwrap()))
+
+    def sum(self) -> 'Tensor':
+        import jax.numpy as jnp
+        return Tensor(jnp.sum(self.unwrap()))
 
     def repeat(self, func: callable, times: int) -> 'Tensor':
         """Executes a function multiple times using the exact same tied parameters."""
