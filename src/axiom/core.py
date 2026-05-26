@@ -1388,6 +1388,20 @@ class Tensor(NNTensorStubs):
     def __float__(self) -> float:
         return self.item()
 
+    def __str__(self):
+        """Controls what happens when the user calls print(tensor)"""
+        return str(self.unwrap())
+
+    def __repr__(self):
+        """Controls what happens when the tensor is inspected in the console"""
+        # Build a nice string of the topology: e.g., (b=4, s=32, d=16)
+        top_str = ", ".join(f"{a.name}={a.size}" for a in self.topology)
+
+        # Indent the raw JAX array for a clean visual hierarchy
+        raw_repr = repr(self.unwrap()).replace('\n', '\n       ')
+
+        return f"Tensor({raw_repr},\n       topology=({top_str}))"
+
     def __format__(self, format_spec: str) -> str:
         return format(self.item(), format_spec)
 
