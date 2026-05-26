@@ -183,11 +183,11 @@ log_softmax = jax.nn.log_softmax
 def ssm_op(left: tuple, right: tuple):
     """
     Binary operator for parallel linear recurrence.
-    Usage: (A & X).s.scan(nn.ssm_op, associative=True)
+    Usage: (X & A).s.scan(nn.ssm_op, associative=True)
     Computes: h_t = A_t * h_{t-1} + X_t
     """
-    A_i, X_i = left
-    A_j, X_j = right
+    X_i, A_i = left
+    X_j, A_j = right
 
     # Axiom natively handles the broadcasting and topologies!
-    return (A_j * A_i, A_j * X_i + X_j)
+    return (A_j * X_i + X_j, A_j * A_i)
