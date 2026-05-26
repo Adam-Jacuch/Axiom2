@@ -29,6 +29,7 @@ class CompilerState:
         self.param_counter = 0
         self.active_frames = {}
         self.func_calls = {}
+        self.tied_scope_override = None
 
     def reset_pass_state(self):
         """Clears the deterministic trackers at the start of a JAX trace."""
@@ -67,8 +68,10 @@ class CompilerState:
                 target_frame = frame_info.frame
                 break
 
-        # Execution Instance Isolation (gqa_0, gqa_1, ...)
-        if target_frame is not None:
+        # Execution Instance Isolation AND Scope Override
+        if self.tied_scope_override:
+            scope_id = self.tied_scope_override
+        elif target_frame is not None:
             if target_frame not in self.active_frames:
                 count = self.func_calls.get(scope_func, 0)
                 self.func_calls[scope_func] = count + 1
@@ -1087,9 +1090,20 @@ class Bundle:
         return self.maximum()
 
     def repeat(self, func: callable, times: int) -> 'Bundle':
+        """Executes a function multiple times over a bundle using tied parameters."""
         import jax.lax as lax
 
+        repeat_scope = f"repeat_block_{compiler_state.param_counter}"
+        prev_override = compiler_state.tied_scope_override
+        start_counter = compiler_state.param_counter
+
+        compiler_state.tied_scope_override = repeat_scope
+        _ = func(self)
+        end_counter = compiler_state.param_counter
+
         def _scan_body(carry_raw_tuple, _):
+            compiler_state.param_counter = start_counter
+
             carry_tensors = [Tensor(raw, *orig_t.topology) for raw, orig_t in zip(carry_raw_tuple, self.tensors)]
             out_bundle = func(Bundle(*carry_tensors))
 
@@ -1101,6 +1115,10 @@ class Bundle:
             return tuple(out_raw_tuple), None
 
         final_raw_tuple, _ = lax.scan(_scan_body, tuple(t.unwrap() for t in self.tensors), None, length=times)
+
+        compiler_state.tied_scope_override = prev_override
+        compiler_state.param_counter = end_counter
+
         return Bundle(*[Tensor(raw, *orig_t.topology) for raw, orig_t in zip(final_raw_tuple, self.tensors)])
 
 
@@ -1158,12 +1176,33 @@ class Tensor(NNTensorStubs):
         return self._broadcast_op(other, jnp.maximum)
 
     def repeat(self, func: callable, times: int) -> 'Tensor':
+        """Executes a function multiple times using the exact same tied parameters."""
         import jax.lax as lax
+
+        # Generate a unique, isolated scope for this entire recurrent block
+        repeat_scope = f"repeat_block_{compiler_state.param_counter}"
+
+        prev_override = compiler_state.tied_scope_override
+        start_counter = compiler_state.param_counter
+
+        # 1. The Ghost Pass: Eagerly allocate the parameters in the outer scope
+        compiler_state.tied_scope_override = repeat_scope
+        _ = func(self)
+        end_counter = compiler_state.param_counter
+
+        # 2. The Trace Pass: Force the scan to reuse the exact same names
         def _scan_body(carry_raw, _):
+            # Reset counter at the start of every iteration to guarantee weight sharing!
+            compiler_state.param_counter = start_counter
             out_tensor = func(Tensor(carry_raw, *self.topology))
             return out_tensor.unwrap(), None
 
         final_raw, _ = lax.scan(_scan_body, self.unwrap(), None, length=times)
+
+        # 3. Cleanup: Restore state so future layers allocate uniquely
+        compiler_state.tied_scope_override = prev_override
+        compiler_state.param_counter = end_counter
+
         return Tensor(final_raw, *self.topology)
 
     def vmask(self, func, fill: float = 0.0) -> 'Tensor':

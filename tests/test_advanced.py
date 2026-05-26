@@ -1198,3 +1198,57 @@ def test_bundle_unpacking():
     assert jnp.allclose(k1.unwrap(), jnp.zeros((2, 4)))
 
     print("Parallel Bundle unpacking passed!\n")
+
+
+# ==========================================
+# 26. TEST: Recurrent Weight Tying (.repeat)
+# ==========================================
+def test_repeat_weight_tying():
+    print("--- Testing Recurrent Weight Tying (.repeat) ---")
+
+    # 1. Clear global compiler state to prevent bleed from previous tests
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    # ----------------------------------------
+    # Part 1: Single Tensor Repeat
+    # ----------------------------------------
+    def recurrent_block(x: Tensor) -> Tensor:
+        # THE FIX: Use ax("d") instead of the globally polluted ax.d
+        # Your new inference engine will perfectly infer its size as 4!
+        return x.d.proj(ax("d"))
+
+    # Explicitly instantiate the sized axes to avoid global bleed
+    x = init.ones(ax("b", 2), ax("d", 4))
+
+    # Execute the block 5 times
+    out = x.repeat(recurrent_block, times=5)
+
+    # Topological Safety
+    assert out.topology == (ax("b", 2), ax("d", 4)), "Topology mismatch after repeat."
+
+    # Weight Sharing Proof
+    # 1 weight + 1 bias = 2 parameters total for the entire recurrent loop!
+    assert len(compiler_state.params) == 2, f"Weight tying failed! Params: {compiler_state.params.keys()}"
+
+    print("Tensor .repeat() weight tying passed!")
+
+    # ----------------------------------------
+    # Part 2: Parallel Bundle Repeat
+    # ----------------------------------------
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    def bundle_block(b):
+        return b.d.proj(ax("d"))
+
+    b_in = x & x
+
+    # Execute the parallel bundle block 5 times
+    b_out = b_in.repeat(bundle_block, times=5)
+
+    # Weight Sharing Proof for Bundles
+    # 2 tensors * (1 weight + 1 bias) = 4 parameters total.
+    assert len(compiler_state.params) == 4, f"Bundle tying failed! Params: {compiler_state.params.keys()}"
+
+    print("Bundle .repeat() weight tying passed!\n")
