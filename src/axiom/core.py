@@ -682,7 +682,8 @@ class TargetedTensor(NNTargetedTensorStubs):
         from .compiler import compiler_state
 
         target_ax = self.target_axes[0]
-        seq_idx = self.topology.index(target_ax)
+        base_tensor = self.tensor  # <-- THE FIX: Extract the underlying Tensor!
+        seq_idx = base_tensor.topology.index(target_ax)
 
         # --- 1. Weight Tying Scope Setup ---
         scan_scope = f"scan_block_{compiler_state.param_counter}"
@@ -690,28 +691,25 @@ class TargetedTensor(NNTargetedTensorStubs):
         start_counter = compiler_state.param_counter
 
         # --- 2. The Ghost Pass Bypass ---
-        # We MUST allocate physical parameters outside of lax.scan to avoid Tracer Leaks!
         if compiler_state.is_initializing:
             compiler_state.tied_scope_override = scan_scope
 
-            # Take the very first sequence element (t=0)
-            raw_slice = jnp.take(self.unwrap(), 0, axis=seq_idx)
-            slice_top = tuple(a for a in self.topology if a != target_ax)
+            # Use base_tensor instead of self!
+            raw_slice = jnp.take(base_tensor.unwrap(), 0, axis=seq_idx)
+            slice_top = tuple(a for a in base_tensor.topology if a != target_ax)
             mock_x = Tensor(raw_slice, *slice_top)
 
-            # Eagerly execute the body to force real physical allocation!
             _ = func(init, mock_x)
 
         # --- 3. The Trace Pass ---
         compiler_state.tied_scope_override = scan_scope
 
-        # Transpose sequence axis to the front for JAX
-        perm = [seq_idx] + [i for i in range(len(self.topology)) if i != seq_idx]
-        xs_transposed = jnp.transpose(self.unwrap(), axes=perm)
-        xt_topology = tuple(self.topology[i] for i in perm[1:])
+        # Route all permutations through base_tensor
+        perm = [seq_idx] + [i for i in range(len(base_tensor.topology)) if i != seq_idx]
+        xs_transposed = jnp.transpose(base_tensor.unwrap(), axes=perm)
+        xt_topology = tuple(base_tensor.topology[i] for i in perm[1:])
 
         def wrapped_func(raw_carry, raw_xt):
-            # Lock the counter so every timestep reuses the exact same weights
             compiler_state.param_counter = start_counter
             new_carry, out_y = func(Tensor(raw_carry, *init.topology), Tensor(raw_xt, *xt_topology))
             return new_carry.unwrap(), out_y.unwrap()
@@ -720,17 +718,15 @@ class TargetedTensor(NNTargetedTensorStubs):
 
         # --- 4. Cleanup & State Restoration ---
         compiler_state.tied_scope_override = prev_override
-
-        # Safely increment counter past the newly allocated variables
         allocated = len([k for k in compiler_state.params if k.startswith(scan_scope)])
         compiler_state.param_counter = start_counter + allocated
 
-        # Restore original memory layout
-        inv_perm = [0] * len(self.topology)
+        inv_perm = [0] * len(base_tensor.topology)
         for i, p in enumerate(perm):
             inv_perm[p] = i
 
-        return Tensor(final_carry_raw, *init.topology), Tensor(jnp.transpose(y_seq_raw, inv_perm), *self.topology)
+        return Tensor(final_carry_raw, *init.topology), Tensor(jnp.transpose(y_seq_raw, inv_perm),
+                                                               *base_tensor.topology)
 
     def sample(self, temp: float = 1.0) -> 'Tensor':
         from .state import state
