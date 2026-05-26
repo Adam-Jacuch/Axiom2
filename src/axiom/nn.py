@@ -47,27 +47,40 @@ def rms_norm(targeted: TargetedTensor, tie: str = None, eps: float = 1e-5) -> Te
 # 2. LOSS FUNCTIONS (Pure Axiom Math)
 # ==========================================
 
-def mse_loss(preds: Tensor, targets: Tensor) -> Tensor:
-    return (preds - targets).square()
+def _apply_reduction(loss: Tensor, reduction: str) -> Tensor:
+    """Internal helper to collapse loss topologies."""
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    elif reduction == 'none':
+        return loss
+    else:
+        raise ValueError(f"Invalid reduction type: '{reduction}'. Expected 'mean', 'sum', or 'none'.")
+
+def mse_loss(preds: Tensor, targets: Tensor, reduction: str = 'mean') -> Tensor:
+    loss = (preds - targets).square()
+    return _apply_reduction(loss, reduction)
 
 
-def l1_loss(preds: Tensor, targets: Tensor) -> Tensor:
-    return (preds - targets).abs()
+def l1_loss(preds: Tensor, targets: Tensor, reduction: str = 'mean') -> Tensor:
+    loss = (preds - targets).abs()
+    return _apply_reduction(loss, reduction)
 
 
-def huber_loss(preds: Tensor, targets: Tensor, delta: float = 1.0) -> Tensor:
+def huber_loss(preds: Tensor, targets: Tensor, delta: float = 1.0, reduction: str = 'mean') -> Tensor:
     diff = (preds - targets).abs()
-    # Still requires .pw() for custom lambda logic, which is perfect!
-    return diff.pw(lambda x: jnp.where(x < delta, 0.5 * jnp.square(x), delta * (x - 0.5 * delta)))
+    loss = diff.pw(lambda x: jnp.where(x < delta, 0.5 * jnp.square(x), delta * (x - 0.5 * delta)))
+    return _apply_reduction(loss, reduction)
 
 
-def bce_with_logits(logits: Tensor, targets: Tensor) -> Tensor:
+def bce_with_logits(logits: Tensor, targets: Tensor, reduction: str = 'mean') -> Tensor:
     max_val = logits.clip(0, None)
     log_weight = logits.abs().pw(lambda x: jnp.log(1 + jnp.exp(-x)))
-    return max_val - (logits * targets) + log_weight
+    loss = max_val - (logits * targets) + log_weight
+    return _apply_reduction(loss, reduction)
 
-
-def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor) -> Tensor:
+def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor, reduction: str = 'mean') -> Tensor:
     """
     Cross entropy over a targeted class axis.
 
@@ -129,25 +142,19 @@ def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor) -> Tensor:
     loss_raw = -jnp.take_along_axis(log_probs_raw, gather_idx, axis=class_idx)
     loss_raw = jnp.squeeze(loss_raw, axis=class_idx)
 
-    return Tensor(loss_raw, *out_topology)
+    return _apply_reduction(Tensor(loss_raw, *out_topology), reduction)
 
 
-def reinforce(logits: 'TargetedTensor', actions: Tensor, advantages: Tensor) -> Tensor:
-    """
-    Standard Policy Gradient Loss.
-    logits: The unnormalized action probabilities, targeted on the action axis (e.g., out.a)
-    actions: The chosen integer actions.
-    advantages: The TD-Error or Advantage scalar (must be detached from the gradient!).
-    """
-    # Cross entropy calculates the negative log probability of the chosen action.
-    neg_log_prob = cross_entropy_loss(logits, actions)
+def reinforce(logits: 'TargetedTensor', actions: Tensor, advantages: Tensor, reduction: str = 'mean') -> Tensor:
+    # Notice we must force 'none' on the internal cross entropy call
+    # so we can multiply by the advantages before reducing!
+    neg_log_prob = cross_entropy_loss(logits, actions, reduction='none')
 
-    # Multiply by the advantage (which acts as a scaling weight)
-    # We use .pw() to ensure we don't accidentally backprop through the advantage!
     import jax
     safe_advantages = advantages.pw(jax.lax.stop_gradient)
+    loss = neg_log_prob * safe_advantages
 
-    return neg_log_prob * safe_advantages
+    return _apply_reduction(loss, reduction)
 
 
 # ==========================================
