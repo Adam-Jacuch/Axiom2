@@ -988,16 +988,36 @@ class TargetedBundle(NNTargetedBundleStubs):
         return tuple(
             TargetedTensor(t, self.target_axes).rename(new_ax) for t, new_ax in zip(self.bundle.tensors, new_axes))
 
-    def join(self) -> 'Tensor':
-        target_ax = self.target_axes[0]
-        base_tensor = self.bundle.tensors[0]
-        ax_idx = base_tensor.topology.index(target_ax)
+    def join(self) -> 'TargetedTensor':
+        import jax.numpy as jnp
 
-        raw_arrays = [t.unwrap() for t in self.bundle.tensors]
+        target_ax = self.target_axes[0]
+        base_top = self.bundle.tensors[0].topology
+
+        raw_arrays = []
+        for t in self.bundle.tensors:
+            if t.topology != base_top:
+                try:
+                    perm = [t.topology.index(a) for a in base_top]
+                    raw_arrays.append(jnp.transpose(t.unwrap(), axes=perm))
+                except ValueError:
+                    raise ValueError(
+                        f"Cannot join tensors with incompatible topologies. "
+                        f"Expected axes {base_top}, but got {t.topology}"
+                    )
+            else:
+                raw_arrays.append(t.unwrap())
+
+        ax_idx = base_top.index(target_ax)
+
+        # Calculate the new total size along the joined axis
         total_size = sum(t.topology[t.topology.index(target_ax)].size for t in self.bundle.tensors)
 
-        new_topology = list(base_tensor.topology)
+        # Build the new topology using base_top!
+        from .core import Axis  # (ensure Axis is available, though it usually is in this file)
+        new_topology = list(base_top)
         new_topology[ax_idx] = Axis(target_ax.name, total_size)
+
         return Tensor(jnp.concatenate(raw_arrays, axis=ax_idx), *new_topology)
 
     def pad(self, *pad_widths: Tuple[int, int], fill: float = 0.0) -> Tuple['Tensor', ...]:
