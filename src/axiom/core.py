@@ -321,6 +321,12 @@ class SlicedMonad:
     def __neg__(self):
         return self._wrap(-self.chunk_tensor)
 
+    def __pow__(self, other):
+        return self._binary_value_or_patch(other, operator.pow)
+
+    def __rpow__(self, other):
+        return self._rbinary_value_or_patch(other, operator.pow)
+
     def __matmul__(self, other):
         return self.chunk_tensor @ self._unwrap_other(other)
 
@@ -1203,6 +1209,13 @@ class Tensor(NNTensorStubs):
     def __rtruediv__(self, other):
         return other._broadcast_op(self, operator.truediv) if isinstance(other, Tensor) else Tensor(
             operator.truediv(other, self.unwrap()), *self._axes)
+
+    def __pow__(self, other):
+        return self._broadcast_op(other, operator.pow)
+
+    def __rpow__(self, other):
+        return other._broadcast_op(self, operator.pow) if isinstance(other, Tensor) else Tensor(
+            operator.pow(other, self.unwrap()), *self._axes)
 
     def __matmul__(self, other: 'Tensor') -> 'Tensor':
         shared_axes = [a for a in self.topology if a in other.topology]
