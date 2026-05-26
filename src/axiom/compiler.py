@@ -278,12 +278,19 @@ def apply_updates(model: AxiomModel, grads: Any, optimizer: Any, opt_state: Any)
     return new_model, new_opt_state
 
 
-def to_jax(model: 'AxiomModel', *init_axes: 'Axis'):
+def to_jax(model, *init_axes: 'Axis'):
     """
     Converts an AxiomModel into a pure JAX (params, apply_fn) paradigm.
     If init_axes are provided, it automatically initializes the model weights.
     """
-    # --- NEW: Auto-Initialization ---
+    import inspect
+
+    # If the user passed a raw Python function, quietly wrap it for them!
+    if inspect.isfunction(model):
+        from axiom import ax  # Lazy import to prevent circular dependencies
+        model = ax.model(model)
+
+    # Auto-Initialization
     if init_axes and not model.is_initialized:
         import jax.numpy as jnp
         from .core import Tensor, Axis
