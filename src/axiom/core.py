@@ -845,30 +845,60 @@ class TargetedTensor(NNTargetedTensorStubs):
         for i in range(target_ax.size):
             yield self[i]
 
-    def __getitem__(self, key: Any) -> Any:
-        if key == slice(None): return self.tensor
-        if hasattr(key, "chunk_tensor"): key = key.chunk_tensor
-        if hasattr(key, 'topology'): return RoutedContext(self.tensor, self.target_axes, key)
+    def __getitem__(self, item: Any) -> Any:
+        """Allows shape-safe slicing, integer indexing, and routed gathering."""
+        import jax.numpy as jnp
 
-        target = self.target_axes[0]
-        ax_idx = self.tensor.topology.index(target)
+        # 1. Monad Stitching Fallback
+        if item == slice(None):
+            return self.tensor
 
-        full_slice = [slice(None)] * len(self.tensor.topology)
-        full_slice[ax_idx] = key
-        sliced_raw = self.tensor.unwrap()[tuple(full_slice)]
+        # 2. Routed Context (Gathering)
+        # If the index is another Tensor, intercept it for .gather()!
+        if hasattr(item, 'topology'):
+            return RoutedContext(self.tensor, self.target_axes, item)
 
-        if isinstance(key, int):
-            new_topology = list(self.tensor.topology)
-            new_topology.pop(ax_idx)
+        # Decay monads if passed as an index
+        if hasattr(item, "chunk_tensor"):
+            item = item.chunk_tensor
+
+        if len(self.target_axes) > 1:
+            raise ValueError("Slicing multiple axes at once is not yet supported.")
+
+        target_ax = self.target_axes[0]
+        base_tensor = self.tensor
+        ax_idx = base_tensor.topology.index(target_ax)
+
+        # Build JAX slice tuple
+        full_slices = [slice(None)] * len(base_tensor.topology)
+        full_slices[ax_idx] = item
+        sliced_raw = base_tensor.unwrap()[tuple(full_slices)]
+
+        # 3. Shape Safety & Monad Routing
+        if isinstance(item, slice):
+            # Range slicing preserves the axis but changes its size
+            start, stop, step = item.indices(target_ax.size)
+            new_size = len(range(start, stop, step))
+
+            from .core import Axis
+            new_ax = Axis(target_ax.name, new_size)
+            new_topology = tuple(new_ax if a == target_ax else a for a in base_tensor.topology)
+
+            chunk_tensor = Tensor(sliced_raw, *new_topology)
+
+            # THE FIX: Wrap it back in a SlicedMonad so you can stitch it later!
+            return SlicedMonad(
+                base_tensor, target_ax, item, chunk_tensor,
+                expected_topology=chunk_tensor.topology, patch_safe=True
+            )
+
+        elif isinstance(item, int):
+            # Integer indexing completely removes the axis!
+            new_topology = tuple(a for a in base_tensor.topology if a != target_ax)
             return Tensor(sliced_raw, *new_topology)
 
-        new_topology = list(self.tensor.topology)
-        new_topology[ax_idx] = Axis(target.name, sliced_raw.shape[ax_idx])
-        chunk_tensor = Tensor(sliced_raw, *new_topology)
-
-        return SlicedMonad(self.tensor, target, key, chunk_tensor, expected_topology=chunk_tensor.topology,
-                           patch_safe=True)
-
+        else:
+            raise TypeError("Axiom currently only supports integer, slice, or Tensor indexing.")
 
 class TargetedBundle(NNTargetedBundleStubs):
     """Handles operations targeted across multiple tensors simultaneously."""
