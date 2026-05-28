@@ -157,6 +157,31 @@ def reinforce(logits: 'TargetedTensor', actions: Tensor, advantages: Tensor, red
     return _apply_reduction(loss, reduction)
 
 
+def infonce_loss(query: Tensor, key: Tensor, batch_ax: 'Axis', temp: float = 0.07, reduction: str = 'mean') -> Tensor:
+    """
+    InfoNCE (Contrastive) Loss.
+    Automatically computes the cross-batch similarity matrix and applies cross entropy.
+    """
+    from .core import Axis, TargetedTensor
+    from . import init
+
+    # 1. Rename the key's batch axis to prevent it from broadcasting linearly!
+    batch_ax_k = Axis(batch_ax.name + "_k", batch_ax.size)
+    key_renamed = TargetedTensor(key, (batch_ax,)).rename(batch_ax_k)
+
+    # 2. Compute similarities
+    # Axiom automatically contracts the shared embedding axes (e.g., 'd')
+    # and leaves a pure (batch_ax, batch_ax_k) similarity matrix!
+    logits = (query @ key_renamed) / temp
+
+    # 3. The correct labels are the diagonal indices (0, 1, 2, ... N-1)
+    targets = init.arange(batch_ax.size, batch_ax)
+
+    # 4. Cross Entropy over the renamed key batch axis!
+    # Because cross_entropy_loss already handles _apply_reduction, we just return it directly.
+    return cross_entropy_loss(getattr(logits, batch_ax_k.name), targets, reduction=reduction)
+
+
 # ==========================================
 # 3. ACTIVATIONS (JAX Aliases)
 # ==========================================
@@ -198,3 +223,58 @@ def ssm_op(left: tuple, right: tuple):
 
     # Axiom natively handles the broadcasting and topologies!
     return (A_j * X_i + X_j, A_j * A_i)
+
+@axiom_nn_op
+def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float = 10000.0, rot_fraction: float = 1.0) -> Tensor:
+    """
+    Rotary Position Embedding (supports partial rotation).
+    Usage: x.d.pw(nn.rope, seq_ax=ax.s, rot_fraction=0.5)
+    """
+    from . import init
+    import jax.numpy as jnp
+    from .core import Axis, TargetedTensor
+
+    x = targeted.tensor
+    feat_ax = targeted.target_axes[0]
+    rot_dim = int(feat_ax.size * rot_fraction)
+
+    # 1. Handle Partial Rotation Splitting
+    if rot_fraction < 1.0:
+        x_rot = targeted[:rot_dim]
+        x_pass = targeted[rot_dim:]
+        rot_ax = Axis(feat_ax.name, rot_dim)
+    else:
+        x_rot = x
+        x_pass = None
+        rot_ax = feat_ax
+
+    # 2. Slice the rotation chunk in half
+    half_dim = rot_dim // 2
+    x1 = TargetedTensor(x_rot, (rot_ax,))[:half_dim]
+    x2 = TargetedTensor(x_rot, (rot_ax,))[half_dim:]
+
+    # 3. Rotate (-x2, x1) and join
+    rotated = getattr((-x2) & x1, rot_ax.name).join()
+
+    # 4. Generate Frequencies
+    t = init.arange(seq_ax.size, seq_ax)
+    half_ax = Axis("_half", half_dim)
+    powers = init.arange(0, rot_dim, 2, half_ax) / rot_dim
+    inv_freq = 1.0 / (base ** powers)
+    freqs = t * inv_freq
+
+    # Duplicate frequencies for both halves and join
+    joined_freqs = getattr(freqs & freqs, half_ax.name).join()
+    freqs_full = getattr(joined_freqs, half_ax.name).rename(rot_ax)
+
+    cos, sin = freqs_full.pw(jnp.cos), freqs_full.pw(jnp.sin)
+
+    # 5. Apply RoPE
+    x_out = (x_rot * cos) + (rotated * sin)
+
+    # 6. Re-stitch if partial
+    if x_pass is not None:
+        stitched = getattr(x_out & x_pass, rot_ax.name).join()
+        return getattr(stitched, rot_ax.name).rename(feat_ax)
+
+    return x_out

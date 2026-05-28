@@ -1252,3 +1252,62 @@ def test_repeat_weight_tying():
     assert len(compiler_state.params) == 4, f"Bundle tying failed! Params: {compiler_state.params.keys()}"
 
     print("Bundle .repeat() weight tying passed!\n")
+
+
+def test_rope_partial_rotation():
+    print("--- Testing Partial Rotary Position Embedding ---")
+    import jax.numpy as jnp
+    from axiom import ax, wrap
+
+    ax.s = ax("s", 4)
+    ax.d = ax("d", 16)
+
+    # Create a deterministic sequence tensor
+    raw_x = jnp.arange(4 * 16, dtype=jnp.float32).reshape(4, 16)
+    x = wrap(raw_x, ax.s, ax.d)
+
+    # Apply 50% partial RoPE!
+    # Notice how we can call .rope() directly thanks to your dynamic __getattr__!
+    out = x.d.rope(seq_ax=ax.s, rot_fraction=0.5)
+
+    # 1. Topological Safety
+    assert out.topology == x.topology, "RoPE illegally altered the topology!"
+
+    # 2. Functional Safety: The unrotated half MUST be perfectly identical
+    # Because rot_fraction=0.5 and d=16, indices 8:16 should be untouched.
+    x_unrotated = x.d[8:].unwrap()
+    out_unrotated = out.d[8:].unwrap()
+    assert jnp.allclose(x_unrotated, out_unrotated), "Partial RoPE corrupted the pass-through dimensions!"
+
+    # 3. Mathematical Execution: The rotated half MUST change
+    x_rotated = x.d[:8].unwrap()
+    out_rotated = out.d[:8].unwrap()
+    assert not jnp.allclose(x_rotated, out_rotated), "RoPE failed to rotate the targeted dimensions!"
+
+
+def test_infonce_contrastive_matching():
+    print("--- Testing InfoNCE Contrastive Loss ---")
+    import jax.numpy as jnp
+    from axiom import ax, wrap, nn
+
+    ax.b = ax("b", 2)
+    ax.d = ax("d", 2)
+
+    # Queries: A batch of two distinct one-hot vectors
+    query = wrap(jnp.array([[1.0, 0.0], [0.0, 1.0]]), ax.b, ax.d)
+
+    # Perfect Keys: Exact match to the queries
+    k_perfect = wrap(jnp.array([[1.0, 0.0], [0.0, 1.0]]), ax.b, ax.d)
+
+    # Opposite Keys: Completely mismatched
+    k_opposite = wrap(jnp.array([[0.0, 1.0], [1.0, 0.0]]), ax.b, ax.d)
+
+    # Compute both losses using our new topological reduction default
+    loss_perfect = nn.infonce_loss(query, k_perfect, batch_ax=ax.b, temp=0.1)
+    loss_opposite = nn.infonce_loss(query, k_opposite, batch_ax=ax.b, temp=0.1)
+
+    # 1. Topological Safety
+    assert len(loss_perfect.topology) == 0, "InfoNCE default reduction failed to collapse to a scalar!"
+
+    # 2. Mathematical Safety: Mismatched keys should result in a higher loss!
+    assert loss_perfect.item() < loss_opposite.item(), "InfoNCE failed to penalize mismatched contrastive pairs!"
