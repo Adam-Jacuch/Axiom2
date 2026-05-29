@@ -1373,7 +1373,7 @@ def test_model_serialization():
     assert not model_b.is_initialized, "Model B should be completely blank!"
 
     # 4. Load weights from disk
-    ax.load(model_b, save_path)
+    ax.load(save_path, target=model_b)
     assert model_b.is_initialized, "ax.load failed to update initialization flag!"
 
     # 5. Verify byte-for-byte parameter equivalence

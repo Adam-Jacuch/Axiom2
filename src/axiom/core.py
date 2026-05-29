@@ -197,25 +197,30 @@ class _AxisNamespace:
         stacked_raw = jnp.stack(raw_arrays, axis=0)
         return wrap(stacked_raw, new_axis, *base_top)
 
-    def save(self, model: Any, path: str):
-        """Saves an AxiomModel's parameters to disk using compressed numpy format."""
+    def save(self, target: Any, path: str):
+        """Saves an AxiomModel OR a raw parameter dictionary to disk."""
         import numpy as np
 
-        if not hasattr(model, 'params') or not model.params:
-            raise ValueError("Model has no parameters to save. Has it been initialized?")
+        # Extract params whether it's an AxiomModel or a raw dict
+        params = target.params if hasattr(target, 'params') else target
 
-        # Convert JAX arrays to standard NumPy arrays for safe, portable storage
-        numpy_params = {k: np.array(v) for k, v in model.params.items()}
+        if not isinstance(params, dict) or not params:
+            raise ValueError("Target has no parameters to save.")
 
-        # Append .npz extension automatically if not provided
+        numpy_params = {k: np.array(v) for k, v in params.items()}
+
         if not path.endswith('.npz'):
             path += '.npz'
 
         np.savez_compressed(path, **numpy_params)
         print(f"Saved {len(numpy_params)} parameters to {path}")
 
-    def load(self, model: Any, path: str):
-        """Loads parameters from disk directly into an AxiomModel."""
+    def load(self, path: str, *, target: Any = None):
+        """
+        Loads parameters from disk.
+        If 'target' is an AxiomModel, it injects the weights directly.
+        If 'target' is None, it returns the raw JAX parameter dictionary.
+        """
         import numpy as np
         import jax.numpy as jnp
 
@@ -223,12 +228,21 @@ class _AxisNamespace:
             path += '.npz'
 
         loaded = np.load(path)
+        params_dict = {k: jnp.array(loaded[k]) for k in loaded.files}
 
-        # Convert back to JAX arrays and inject into the model's state dictionary
-        model.params = {k: jnp.array(loaded[k]) for k in loaded.files}
-        model.is_initialized = True
+        # Paradigm 1: AxiomModel Injection
+        if target is not None:
+            if hasattr(target, 'params'):
+                target.params = params_dict
+                target.is_initialized = True
+                print(f"Loaded {len(target.params)} parameters into model from {path}")
+                return
+            else:
+                raise TypeError("Target must be an AxiomModel or None.")
 
-        print(f"Loaded {len(model.params)} parameters from {path}")
+        # Paradigm 2: Pure JAX Dictionary Return
+        print(f"Loaded {len(params_dict)} parameters from {path}")
+        return params_dict
 
     def __getattr__(self, name: str) -> Axis:
         return Axis(name)
