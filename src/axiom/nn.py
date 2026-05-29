@@ -224,7 +224,10 @@ def embed(tokens: Tensor, vocab_ax: 'Axis', embed_ax: 'Axis', tie: str = None, i
     if vocab_ax.size is None or embed_ax.size is None:
         raise ValueError("Embedding requires strict sizes for both the vocabulary and embedding axes.")
 
-    initializer = init if init is not None else ax_init.normal
+    def default_init(key, shape):
+        return ax_init.normal(key, shape) * 0.02
+
+    initializer = init if init is not None else default_init
 
     # 1. Allocate the continuous weight matrix (vocab_size, d_model)
     emb_raw = state.get_param("embedding", (vocab_ax.size, embed_ax.size), initializer, tie=tie)
