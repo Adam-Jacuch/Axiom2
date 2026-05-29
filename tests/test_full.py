@@ -1311,3 +1311,76 @@ def test_infonce_contrastive_matching():
 
     # 2. Mathematical Safety: Mismatched keys should result in a higher loss!
     assert loss_perfect.item() < loss_opposite.item(), "InfoNCE failed to penalize mismatched contrastive pairs!"
+
+
+def test_embedding_layer():
+    print("--- Testing Embedding Layer ---")
+    import jax.numpy as jnp
+    from axiom import ax, wrap, nn
+    from axiom.core import compiler_state
+
+    # Clear state from previous tests
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    ax.s = ax("s", 3)
+    ax.vocab = ax("vocab", 10)
+    ax.d = ax("d", 4)
+
+    # Sequence of tokens: [2, 0, 9]
+    tokens = wrap(jnp.array([2, 0, 9], dtype=jnp.int32), ax.s)
+
+    # Eagerly execute to allocate the weights and perform the gather
+    out = nn.embed(tokens, ax.vocab, ax.d)
+
+    # 1. Topological Safety: ax.vocab should be consumed, ax.d should appear!
+    assert out.topology == (ax.s, ax.d), f"Embedding topology failed! Expected {(ax.s, ax.d)}, got {out.topology}"
+
+    # 2. Extract the allocated weight matrix dynamically
+    emb_key = next(k for k in compiler_state.params if "embedding" in k)
+    weight_matrix = compiler_state.params[emb_key]
+
+    # 3. Functional Safety: The gathered vectors MUST match manual array slicing
+    expected_out = weight_matrix[jnp.array([2, 0, 9])]
+    assert jnp.allclose(out.unwrap(), expected_out), "Embedding layer gathered the wrong vectors!"
+
+def test_model_serialization():
+    print("--- Testing Model Serialization ---")
+    import os
+    import jax.numpy as jnp
+    from axiom import ax, nn, init, Tensor
+
+    ax.b = ax("b", 1)
+    ax.d = ax("d", 16)
+
+    def simple_model(x: Tensor):
+        return x.d.proj(bias=False)
+
+    # 1. Create and initialize Model A
+    model_a = ax.model(simple_model)
+    dummy_x = init.ones(ax.b, ax.d)
+    _ = model_a(dummy_x)  # Trigger the Ghost Pass
+
+    assert model_a.is_initialized, "Model A failed to initialize!"
+
+    # 2. Serialize to disk
+    save_path = "test_axiom_model.npz"
+    ax.save(model_a, save_path)
+    assert os.path.exists(save_path), "ax.save failed to write the file!"
+
+    # 3. Create a blank Model B
+    model_b = ax.model(simple_model)
+    assert not model_b.is_initialized, "Model B should be completely blank!"
+
+    # 4. Load weights from disk
+    ax.load(model_b, save_path)
+    assert model_b.is_initialized, "ax.load failed to update initialization flag!"
+
+    # 5. Verify byte-for-byte parameter equivalence
+    assert len(model_a.params) == len(model_b.params), "Parameter count mismatch after loading!"
+    for key in model_a.params:
+        assert key in model_b.params, f"Missing parameter '{key}' in loaded model!"
+        assert jnp.allclose(model_a.params[key], model_b.params[key]), f"Weights corrupted during serialization for '{key}'!"
+
+    # 6. Clean up the test file
+    os.remove(save_path)

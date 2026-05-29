@@ -197,6 +197,39 @@ class _AxisNamespace:
         stacked_raw = jnp.stack(raw_arrays, axis=0)
         return wrap(stacked_raw, new_axis, *base_top)
 
+    def save(self, model: Any, path: str):
+        """Saves an AxiomModel's parameters to disk using compressed numpy format."""
+        import numpy as np
+
+        if not hasattr(model, 'params') or not model.params:
+            raise ValueError("Model has no parameters to save. Has it been initialized?")
+
+        # Convert JAX arrays to standard NumPy arrays for safe, portable storage
+        numpy_params = {k: np.array(v) for k, v in model.params.items()}
+
+        # Append .npz extension automatically if not provided
+        if not path.endswith('.npz'):
+            path += '.npz'
+
+        np.savez_compressed(path, **numpy_params)
+        print(f"Saved {len(numpy_params)} parameters to {path}")
+
+    def load(self, model: Any, path: str):
+        """Loads parameters from disk directly into an AxiomModel."""
+        import numpy as np
+        import jax.numpy as jnp
+
+        if not path.endswith('.npz'):
+            path += '.npz'
+
+        loaded = np.load(path)
+
+        # Convert back to JAX arrays and inject into the model's state dictionary
+        model.params = {k: jnp.array(loaded[k]) for k in loaded.files}
+        model.is_initialized = True
+
+        print(f"Loaded {len(model.params)} parameters from {path}")
+
     def __getattr__(self, name: str) -> Axis:
         return Axis(name)
 

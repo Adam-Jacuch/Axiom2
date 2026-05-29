@@ -212,6 +212,27 @@ softmax = jax.nn.softmax
 log_softmax = jax.nn.log_softmax
 
 
+def embed(tokens: Tensor, vocab_ax: 'Axis', embed_ax: 'Axis', tie: str = None, init=None) -> Tensor:
+    """
+    Lookup table for discrete tokens.
+    Usage: x_emb = nn.embed(tokens, ax.vocab, ax.d)
+    """
+    from .state import state
+    from . import init as ax_init
+    from .core import Tensor
+
+    if vocab_ax.size is None or embed_ax.size is None:
+        raise ValueError("Embedding requires strict sizes for both the vocabulary and embedding axes.")
+
+    initializer = init if init is not None else ax_init.normal
+
+    # 1. Allocate the continuous weight matrix (vocab_size, d_model)
+    emb_raw = state.get_param("embedding", (vocab_ax.size, embed_ax.size), initializer, tie=tie)
+    embedding_matrix = Tensor(emb_raw, vocab_ax, embed_ax)
+
+    # 2. Use our beautifully restored RoutedContext to safely gather the vectors!
+    return getattr(embedding_matrix, vocab_ax.name)[tokens].gather()
+
 def ssm_op(left: tuple, right: tuple):
     """
     Binary operator for parallel linear recurrence.
