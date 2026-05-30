@@ -302,3 +302,38 @@ def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float 
         return getattr(stitched, rot_ax.name).rename(feat_ax)
 
     return x_out
+
+
+def flash_attention(query: 'Tensor', key: 'Tensor', value: 'Tensor',
+                    seq_ax: 'Axis', head_ax: 'Axis',
+                    mask: 'Tensor' = None) -> 'Tensor':
+    """
+    Memory-efficient Flash Attention (Auto-fused by XLA).
+    Automatically contracts the hidden dimension between Q and K.
+    """
+    import jax.nn as jnn
+    from .core import Tensor
+
+    # 1. Topological Verification
+    if seq_ax not in query.topology or head_ax not in query.topology:
+        raise ValueError(f"Query must contain seq_ax '{seq_ax.name}' and head_ax '{head_ax.name}'.")
+
+    # 2. Extract the hidden dimension dynamically (the axis that isn't batch, seq, or heads)
+    q_hidden_axes = [a for a in query.topology if a not in (seq_ax, head_ax) and "batch" not in a.name.lower()]
+    if not q_hidden_axes:
+        raise ValueError("Could not infer the hidden dimension axis for the dot product.")
+
+    hidden_ax = q_hidden_axes[0]
+
+    # 3. Unwrap the raw arrays for XLA
+    q_raw, k_raw, v_raw = query.unwrap(), key.unwrap(), value.unwrap()
+    mask_raw = mask.unwrap() if mask is not None else None
+
+    # 4. Execute JAX's native attention
+    out_raw = jnn.dot_product_attention(
+        q_raw, k_raw, v_raw,
+        mask=mask_raw
+    )
+
+    # 5. Restore topological safety
+    return Tensor(out_raw, *query.topology)

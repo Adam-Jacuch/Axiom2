@@ -1384,3 +1384,31 @@ def test_model_serialization():
 
     # 6. Clean up the test file
     os.remove(save_path)
+
+def test_flash_attention():
+    print("--- Testing XLA Flash Attention ---")
+    import jax.numpy as jnp
+    from axiom import ax, wrap, nn
+
+    # Define the topology (Batch, Heads, Sequence, Head_Dim)
+    ax.b = ax("b", 2)
+    ax.h = ax("h", 4)
+    ax.s = ax("s", 8)
+    ax.d = ax("d", 16)
+
+    # 1. Create deterministic tensors
+    # If Q, K, and V are all 1s, the softmax distributes perfectly evenly,
+    # meaning the output should perfectly match V!
+    raw_shape = (2, 4, 8, 16)
+    q = wrap(jnp.ones(raw_shape), ax.b, ax.h, ax.s, ax.d)
+    k = wrap(jnp.ones(raw_shape), ax.b, ax.h, ax.s, ax.d)
+    v = wrap(jnp.ones(raw_shape), ax.b, ax.h, ax.s, ax.d)
+
+    # 2. Execute the memory-efficient attention
+    out = nn.flash_attention(q, k, v, seq_ax=ax.s, head_ax=ax.h)
+
+    # 3. Topological Safety Check
+    assert out.topology == q.topology, "Attention illegally altered the query topology!"
+
+    # 4. Mathematical Safety Check
+    assert jnp.allclose(out.unwrap(), v.unwrap()), "Attention output values are mathematically incorrect!"
