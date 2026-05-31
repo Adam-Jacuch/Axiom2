@@ -244,6 +244,12 @@ class _AxisNamespace:
         print(f"Loaded {len(params_dict)} parameters from {path}")
         return params_dict
 
+    @property
+    def remat(self):
+        """Gradient checkpointing for massive memory savings during backprop."""
+        import jax
+        return jax.checkpoint
+
     def __getattr__(self, name: str) -> Axis:
         return Axis(name)
 
