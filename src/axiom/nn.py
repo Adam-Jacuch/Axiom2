@@ -248,11 +248,12 @@ def ssm_op(left: tuple, right: tuple):
     # Axiom natively handles the broadcasting and topologies!
     return (A_j * X_i + X_j, A_j * A_i)
 
+
 @axiom_nn_op
-def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float = 10000.0, rot_fraction: float = 1.0) -> Tensor:
+def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float = 10000.0,
+         rot_fraction: float = 1.0) -> Tensor:
     """
     Rotary Position Embedding (supports partial rotation).
-    Usage: x.d.pw(nn.rope, seq_ax=ax.s, rot_fraction=0.5)
     """
     from . import init
     import jax.numpy as jnp
@@ -260,6 +261,12 @@ def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float 
 
     x = targeted.tensor
     feat_ax = targeted.target_axes[0]
+
+    # Dynamically resolve the true sequence axis from the tensor's topology!
+    resolved_seq_ax = next((a for a in x.topology if a.name == seq_ax.name), None)
+    if resolved_seq_ax is None or resolved_seq_ax.size is None:
+        raise ValueError(f"Sequence axis '{seq_ax.name}' must exist and have a known size in the tensor topology.")
+
     rot_dim = int(feat_ax.size * rot_fraction)
 
     # 1. Handle Partial Rotation Splitting
@@ -280,8 +287,8 @@ def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float 
     # 3. Rotate (-x2, x1) and join
     rotated = getattr((-x2) & x1, rot_ax.name).join()
 
-    # 4. Generate Frequencies
-    t = init.arange(seq_ax.size, seq_ax)
+    # 4. Generate Frequencies (Using the safely resolved axis!)
+    t = init.arange(resolved_seq_ax.size, resolved_seq_ax)
     half_ax = Axis("_half", half_dim)
     powers = init.arange(0, rot_dim, 2, half_ax) / rot_dim
     inv_freq = 1.0 / (base ** powers)
