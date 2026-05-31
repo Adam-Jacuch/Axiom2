@@ -897,7 +897,7 @@ class TargetedTensor(NNTargetedTensorStubs):
         import jax.numpy as jnp
 
         # 1. Monad Stitching Fallback
-        if item == slice(None):
+        if isinstance(item, slice) and item == slice(None):
             return self.tensor
 
         # 2. Routed Context (Gathering)
