@@ -1412,3 +1412,59 @@ def test_flash_attention():
 
     # 4. Mathematical Safety Check
     assert jnp.allclose(out.unwrap(), v.unwrap()), "Attention output values are mathematically incorrect!"
+
+
+def test_scalable_encoder_remat():
+    print("--- Testing Rematerialized Mixed Precision Encoder ---")
+    import jax.numpy as jnp
+    from axiom import ax, nn, wrap
+
+    # 1. Define the architecture topology
+    ax.b = ax("b", 2)
+    ax.s = ax("s", 8)
+    ax.d = ax("d", 16)
+    ax.h = ax("h", 4)
+    ax.dh = ax("dh", 4)
+    ax.v = ax("v", 100)
+
+    def swiglu(x):
+        u, l = (x & x).d.proj()
+        return (u.silu() * l).d.proj(ax.d)
+
+    def mha(x):
+        q, k, v = (x & x & x).d.proj().d.split(ax.h, ax.dh)
+        k, q = (k & q).dh.rms_norm()
+        k = k.dh.rope(seq_ax=ax.s, rot_fraction=0.5)
+        q = q.dh.rope(seq_ax=ax.s, rot_fraction=0.5)
+        out = nn.flash_attention(q, k, v, seq_ax=ax.s, head_ax=ax.h)
+        return out.dh.h.proj(ax.d)
+
+    # 2. Add Gradient Checkpointing!
+    @ax.remat
+    def block(x):
+        x = x + mha(x.d.rms_norm())
+        return x + swiglu(x.d.rms_norm())
+
+    def test_encoder(tokens):
+        # 3. Native Mixed Precision Cast!
+        x = nn.embed(tokens, ax.v, ax.d).astype(jnp.bfloat16)
+
+        # 4. O(1) Compiled Loop Execution!
+        x = x.repeat(block, times=4)
+        return x.s.mean()
+
+    tokens_raw = jnp.zeros((2, 8), dtype=jnp.int32)
+    tokens = wrap(tokens_raw, ax.b, ax.s)
+
+    # 5. Compile to JAX (Ghost Pass -> Trace Pass)
+    # If tracers leak, this will instantly crash!
+    model = ax.model(test_encoder)
+    params, apply_fn = ax.to_jax(model, ax.b(2), ax.s(8))
+
+    # 6. Execution Pass
+    out = apply_fn(params, tokens)
+
+    # 7. Safety Assertions
+    assert out.topology == (ax.b, ax.d), "Encoder topology mismatch!"
+    assert out.unwrap().dtype == jnp.bfloat16, "Rematerialized encoder failed to retain bfloat16 casting!"
+    print("Rematerialized Mixed Precision Encoder Passed!")

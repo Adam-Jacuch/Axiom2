@@ -61,14 +61,15 @@ class CompilerState:
         dead_frames = [f for f in self.active_frames if f not in alive_frames]
         for f in dead_frames: del self.active_frames[f]
 
-        # Walk up the stack to find the user's function
+        # Walk up the stack to find the user's function, ignoring JAX/Optax/Axiom internals
         for frame_info in stack:
-            if "axiom/" not in frame_info.filename.replace("\\", "/"):
+            filepath = frame_info.filename.replace("\\", "/")
+            if "axiom/" not in filepath and "jax/" not in filepath and "optax/" not in filepath:
                 scope_func = frame_info.function
                 target_frame = frame_info.frame
                 break
 
-        # Execution Instance Isolation AND Scope Override
+        # THE MISSING BLOCK: Execution Instance Isolation AND Scope Override
         if self.tied_scope_override:
             scope_id = self.tied_scope_override
         elif target_frame is not None:
@@ -1251,29 +1252,37 @@ class Bundle:
         prev_override = compiler_state.tied_scope_override
         start_counter = compiler_state.param_counter
 
-        compiler_state.tied_scope_override = repeat_scope
-        _ = func(self)
-        end_counter = compiler_state.param_counter
+        try:
+            # 1. The Ghost Pass
+            compiler_state.tied_scope_override = repeat_scope
+            _ = func(self)
+            end_counter = compiler_state.param_counter
 
-        def _scan_body(carry_raw_tuple, _):
-            compiler_state.param_counter = start_counter
+            # 2. The Trace Pass
+            def _scan_body(carry_raw_tuple, _):
+                compiler_state.param_counter = start_counter
 
-            carry_tensors = [Tensor(raw, *orig_t.topology) for raw, orig_t in zip(carry_raw_tuple, self.tensors)]
-            out_bundle = func(Bundle(*carry_tensors))
+                carry_tensors = [Tensor(raw, *orig_t.topology) for raw, orig_t in zip(carry_raw_tuple, self.tensors)]
+                out_bundle = func(Bundle(*carry_tensors))
 
-            out_raw_tuple = []
-            for in_t, out_t in zip(self.tensors, out_bundle.tensors):
-                if in_t.topology != out_t.topology:
-                    raise ValueError("repeat requires matched topologies for XLA.")
-                out_raw_tuple.append(out_t.unwrap())
-            return tuple(out_raw_tuple), None
+                out_raw_tuple = []
+                # zip over the input raw arrays too, so we know what dtype to cast back to!
+                for in_t, out_t, raw_in in zip(self.tensors, out_bundle.tensors, carry_raw_tuple):
+                    if in_t.topology != out_t.topology:
+                        raise ValueError("repeat requires matched topologies for XLA.")
 
-        final_raw_tuple, _ = lax.scan(_scan_body, tuple(t.unwrap() for t in self.tensors), None, length=times)
+                    # THE FIX: Cast each returned tensor back to its respective input dtype!
+                    out_raw_tuple.append(out_t.unwrap().astype(raw_in.dtype))
 
-        compiler_state.tied_scope_override = prev_override
-        compiler_state.param_counter = end_counter
+                return tuple(out_raw_tuple), None
 
-        return Bundle(*[Tensor(raw, *orig_t.topology) for raw, orig_t in zip(final_raw_tuple, self.tensors)])
+            final_raw_tuple, _ = lax.scan(_scan_body, tuple(t.unwrap() for t in self.tensors), None, length=times)
+            return Bundle(*[Tensor(raw, *orig_t.topology) for raw, orig_t in zip(final_raw_tuple, self.tensors)])
+
+        finally:
+            # 3. Cleanup: Restore state safely even if compilation crashes
+            compiler_state.tied_scope_override = prev_override
+            compiler_state.param_counter = end_counter
 
     def astype(self, dtype) -> 'Bundle':
         """Safely casts an entire bundle of tensors to a new precision."""
@@ -1308,19 +1317,27 @@ class Tensor(NNTensorStubs):
         """Registers the tensor as a trainable parameter for the AOT compiler."""
         self._is_param = True
 
-        # 'tie' is the strict memory-sharing override.
-        # 'name' is just a semantic label for the fallback prefix!
         explicit_tie = tie if isinstance(tie, str) else (tie.name if tie else None)
         fallback = name if name else "param"
 
         true_name = compiler_state.get_scoped_name(explicit_name=explicit_tie, fallback_prefix=fallback)
         self._param_name = true_name
 
-        # Unconditional Write
-        # This guarantees eager execution ALWAYS collects parameters,
-        # making it perfectly consistent with .bias() and .gate()!
-        if true_name not in compiler_state.params:
-            compiler_state.params[true_name] = self.unwrap()
+        import jax
+
+        # Are we actively inside a JAX trace (e.g., @ax.jit)?
+        is_tracing = isinstance(self.unwrap(), jax.core.Tracer)
+
+        # THE FIX: Allow allocation during Ghost Pass OR during Pure Eager Execution!
+        if compiler_state.is_initializing or not is_tracing:
+            if true_name not in compiler_state.params:
+                compiler_state.params[true_name] = self.unwrap()
+        elif true_name not in compiler_state.params:
+            # Trace Pass: Prevent Tracers from leaking into global memory!
+            raise RuntimeError(
+                f"Axiom Tracer Leak Prevention: Parameter '{true_name}' was requested during JAX tracing, "
+                f"but was not allocated during the Ghost Pass! Ensure your stack frames are deterministic."
+            )
 
         return Tensor(compiler_state.params[true_name], *self.topology)
 
@@ -1345,31 +1362,33 @@ class Tensor(NNTensorStubs):
         """Executes a function multiple times using the exact same tied parameters."""
         import jax.lax as lax
 
-        # Generate a unique, isolated scope for this entire recurrent block
         repeat_scope = f"repeat_block_{compiler_state.param_counter}"
-
         prev_override = compiler_state.tied_scope_override
         start_counter = compiler_state.param_counter
 
-        # 1. The Ghost Pass: Eagerly allocate the parameters in the outer scope
-        compiler_state.tied_scope_override = repeat_scope
-        _ = func(self)
-        end_counter = compiler_state.param_counter
+        try:
+            # 1. The Ghost Pass
+            compiler_state.tied_scope_override = repeat_scope
+            _ = func(self)
+            end_counter = compiler_state.param_counter
 
-        # 2. The Trace Pass: Force the scan to reuse the exact same names
-        def _scan_body(carry_raw, _):
-            # Reset counter at the start of every iteration to guarantee weight sharing!
-            compiler_state.param_counter = start_counter
-            out_tensor = func(Tensor(carry_raw, *self.topology))
-            return out_tensor.unwrap(), None
+            # 2. The Trace Pass
+            def _scan_body(carry_raw, _):
+                compiler_state.param_counter = start_counter
+                out_tensor = func(Tensor(carry_raw, *self.topology))
 
-        final_raw, _ = lax.scan(_scan_body, self.unwrap(), None, length=times)
+                # THE FIX: Safely downcast the block's output back to the loop's original dtype!
+                out_raw = out_tensor.unwrap().astype(carry_raw.dtype)
 
-        # 3. Cleanup: Restore state so future layers allocate uniquely
-        compiler_state.tied_scope_override = prev_override
-        compiler_state.param_counter = end_counter
+                return out_raw, None
 
-        return Tensor(final_raw, *self.topology)
+            final_raw, _ = lax.scan(_scan_body, self.unwrap(), None, length=times)
+            return Tensor(final_raw, *self.topology)
+
+        finally:
+            # 3. Cleanup: Restore state safely even if compilation crashes
+            compiler_state.tied_scope_override = prev_override
+            compiler_state.param_counter = end_counter
 
     def vmask(self, func, fill: float = 0.0) -> 'Tensor':
         """Value-based masking. Masks the tensor based on its own values."""
@@ -1508,6 +1527,9 @@ class Tensor(NNTensorStubs):
         return f"Tensor({raw_repr},\n       topology=({top_str}))"
 
     def __format__(self, format_spec: str) -> str:
+        """Safely formats the tensor. Falls back to __str__ if not formatting a scalar."""
+        if format_spec == "":
+            return str(self)
         return format(self.item(), format_spec)
 
 
@@ -1523,7 +1545,8 @@ class RoutedContext:
 
     def gather(self) -> Tensor:
         ax_idx = self.tensor.topology.index(self.target_ax)
-        res_raw = jnp.take(self.tensor.unwrap(), self.indices.unwrap(), axis=ax_idx)
+        safe_indices = self.indices.unwrap().astype(jnp.int32)
+        res_raw = jnp.take(self.tensor.unwrap(), safe_indices, axis=ax_idx)
         new_top = list(self.tensor.topology)
         new_top = new_top[:ax_idx] + list(self.indices.topology) + new_top[ax_idx + 1:]
         return Tensor(res_raw, *new_top)
