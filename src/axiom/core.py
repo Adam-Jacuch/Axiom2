@@ -1269,6 +1269,10 @@ class Bundle:
 
         return Bundle(*[Tensor(raw, *orig_t.topology) for raw, orig_t in zip(final_raw_tuple, self.tensors)])
 
+    def astype(self, dtype) -> 'Bundle':
+        """Safely casts an entire bundle of tensors to a new precision."""
+        return Bundle(*[t.astype(dtype) for t in self.tensors])
+
 
 class Tensor(NNTensorStubs):
     """The core Axiom Tensor wrapper enforcing named-axis topologies."""
@@ -1391,6 +1395,10 @@ class Tensor(NNTensorStubs):
 
         union_axes = self._get_union_topology(other)
         return Tensor(op_func(self._align_to(union_axes), other._align_to(union_axes)), *union_axes)
+
+    def astype(self, dtype) -> 'Tensor':
+        """Safely casts the underlying JAX array to a new precision."""
+        return Tensor(self.unwrap().astype(dtype), *self.topology)
 
     def stop_grad(self) -> 'Tensor':
         return self.pw(jax.lax.stop_gradient)
