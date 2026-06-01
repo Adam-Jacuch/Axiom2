@@ -1266,13 +1266,19 @@ class Bundle:
         prev_override = compiler_state.tied_scope_override
         start_counter = compiler_state.param_counter
 
+        prev_init = compiler_state.is_initializing
         end_counter = start_counter
 
         try:
             # 1. The Ghost Pass
             compiler_state.tied_scope_override = repeat_scope
+
+            # THE FIX: Bypass jax.checkpoint tapes!
+            compiler_state.is_initializing = True
             _ = func(self)
+
             end_counter = compiler_state.param_counter
+            compiler_state.is_initializing = prev_init
 
             # 2. The Trace Pass
             def _scan_body(carry_raw_tuple, _):
@@ -1282,12 +1288,9 @@ class Bundle:
                 out_bundle = func(Bundle(*carry_tensors))
 
                 out_raw_tuple = []
-                # zip over the input raw arrays too, so we know what dtype to cast back to!
                 for in_t, out_t, raw_in in zip(self.tensors, out_bundle.tensors, carry_raw_tuple):
                     if in_t.topology != out_t.topology:
                         raise ValueError("repeat requires matched topologies for XLA.")
-
-                    # THE FIX: Cast each returned tensor back to its respective input dtype!
                     out_raw_tuple.append(out_t.unwrap().astype(raw_in.dtype))
 
                 return tuple(out_raw_tuple), None
@@ -1296,9 +1299,10 @@ class Bundle:
             return Bundle(*[Tensor(raw, *orig_t.topology) for raw, orig_t in zip(final_raw_tuple, self.tensors)])
 
         finally:
-            # 3. Cleanup: Restore state safely even if compilation crashes
+            # 3. Cleanup
             compiler_state.tied_scope_override = prev_override
             compiler_state.param_counter = end_counter
+            compiler_state.is_initializing = prev_init
 
     def astype(self, dtype) -> 'Bundle':
         """Safely casts an entire bundle of tensors to a new precision."""
@@ -1387,31 +1391,38 @@ class Tensor(NNTensorStubs):
         prev_override = compiler_state.tied_scope_override
         start_counter = compiler_state.param_counter
 
+        # Capture the original state
+        prev_init = compiler_state.is_initializing
         end_counter = start_counter
 
         try:
             # 1. The Ghost Pass
             compiler_state.tied_scope_override = repeat_scope
+
+            # THE FIX: Temporarily force initialization to bypass jax.checkpoint tapes!
+            compiler_state.is_initializing = True
             _ = func(self)
+
             end_counter = compiler_state.param_counter
+
+            # Restore the true tracing state before the actual scan loop
+            compiler_state.is_initializing = prev_init
 
             # 2. The Trace Pass
             def _scan_body(carry_raw, _):
                 compiler_state.param_counter = start_counter
                 out_tensor = func(Tensor(carry_raw, *self.topology))
-
-                # THE FIX: Safely downcast the block's output back to the loop's original dtype!
                 out_raw = out_tensor.unwrap().astype(carry_raw.dtype)
-
                 return out_raw, None
 
             final_raw, _ = lax.scan(_scan_body, self.unwrap(), None, length=times)
             return Tensor(final_raw, *self.topology)
 
         finally:
-            # 3. Cleanup: Restore state safely even if compilation crashes
+            # 3. Cleanup
             compiler_state.tied_scope_override = prev_override
             compiler_state.param_counter = end_counter
+            compiler_state.is_initializing = prev_init  # Failsafe restore
 
     def vmask(self, func, fill: float = 0.0) -> 'Tensor':
         """Value-based masking. Masks the tensor based on its own values."""
