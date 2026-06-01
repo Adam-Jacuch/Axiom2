@@ -351,27 +351,27 @@ def dropout(x: 'Tensor', rate: float = 0.1, training: bool = True) -> 'Tensor':
     Axiom-native dropout.
     Uses the deterministic compiler state to guarantee unique PRNG keys per layer!
     """
-    if not training or rate == 0.0:
-        return x
-
     import jax
     import jax.numpy as jnp
     from .state import state
     from .core import compiler_state, Tensor
 
-    keep_rate = 1.0 - rate
-
-    # 1. Guarantee a mathematically unique key for this specific layer
-    # We fold the global layer counter into the root key!
-    layer_key = jax.random.fold_in(state.root_key, compiler_state.param_counter)
-
-    # Advance the counter so the next dropout layer gets a new key
+    # Always reserve the layer's ID to keep the global counter perfectly synchronized
+    layer_id = compiler_state.param_counter
     compiler_state.param_counter += 1
 
-    # 2. Generate the mask matching the tensor's raw physical shape
+    if not training or rate == 0.0:
+        return x
+
+    keep_rate = 1.0 - rate
+
+    # Fold in using the reserved layer_id
+    layer_key = jax.random.fold_in(state.root_key, layer_id)
+
+    # Generate the mask matching the tensor's raw physical shape
     mask = jax.random.bernoulli(layer_key, keep_rate, shape=x.unwrap().shape)
 
-    # 3. Apply mask and scale
+    # Apply mask and scale
     dropped_raw = jnp.where(mask, x.unwrap() / keep_rate, 0.0)
 
     return Tensor(dropped_raw, *x.topology)
