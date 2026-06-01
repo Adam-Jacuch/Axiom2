@@ -70,6 +70,36 @@ class AxiomModel:
 
         return res
 
+    def init(self, *topology: 'Axis') -> 'AxiomModel':
+        """
+        Eagerly initializes the model by running an automatic Ghost Pass.
+        Takes the input topology axes (e.g., ax.b(1), ax.s(12)).
+        """
+        import jax.numpy as jnp
+        from .core import Tensor
+
+        # 1. Verify axes have concrete sizes
+        for a in topology:
+            if not hasattr(a, 'size') or a.size is None:
+                raise ValueError(f"AxiomModel.init() requires strictly sized Axes, got: {a}")
+
+        # 2. Auto-generate the dummy tensor (using int32 to be safe for embeddings)
+        shape = tuple(a.size for a in topology)
+        dummy_input = Tensor(jnp.zeros(shape, dtype=jnp.int32), *topology)
+
+        # 3. Trigger the eager Ghost Pass to allocate memory
+        _ = self(dummy_input)
+
+        return self
+
+    def astype(self, dtype) -> 'AxiomModel':
+        """
+        Globally casts all parameters in the model to a new precision.
+        """
+        import jax
+        self.params = jax.tree.map(lambda p: p.astype(dtype), self.params)
+        return self
+
     # --- NATIVE MODEL CALCULUS (For Meta-Learning & RL) ---
     def __sub__(self, other):
         if isinstance(other, dict):
@@ -114,7 +144,6 @@ class AxiomModel:
     def __contains__(self, key: str):
         return key in self.params
 
-    # ADD THESE TWO METHODS:
     def __iter__(self):
         return iter(self.params)
 
