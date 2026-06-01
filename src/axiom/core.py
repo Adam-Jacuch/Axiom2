@@ -49,34 +49,27 @@ class CompilerState:
             return explicit_name[1:]
 
         scope_func = "global"
-        target_frame_id = None
 
         import sys
-        # THE FIX: Use lightweight CPython frames instead of the leaky inspect module!
+        # 1. Use lightning-fast CPython frame walking
         frame = sys._getframe(1)
 
         try:
-            # Walk up the frame stack directly
+            # 2. Walk up the stack, looking ONLY at the function name, not the memory ID
             while frame:
                 filepath = frame.f_code.co_filename.replace("\\", "/")
                 if "axiom/" not in filepath and "jax/" not in filepath and "optax/" not in filepath:
                     scope_func = frame.f_code.co_name
-                    target_frame_id = id(frame)  # Store memory address, NOT the frame!
                     break
                 frame = frame.f_back
 
-            # Execution Instance Isolation AND Scope Override
+            # 3. Scope resolution (No more active_frames dictionary!)
             if self.tied_scope_override:
                 scope_id = self.tied_scope_override
-            elif target_frame_id is not None:
-                if target_frame_id not in self.active_frames:
-                    count = self.func_calls.get(scope_func, 0)
-                    self.func_calls[scope_func] = count + 1
-                    self.active_frames[target_frame_id] = f"{scope_func}_{count}"
-                scope_id = self.active_frames[target_frame_id]
             else:
                 scope_id = scope_func
 
+            # 4. Generate the deterministic name
             if explicit_name:
                 return f"{scope_id}/{explicit_name}"
             else:
@@ -85,7 +78,7 @@ class CompilerState:
                 return p_name
 
         finally:
-            # Annihilate the local frame reference so JAX tracers vaporize instantly!
+            # 5. Annihilate the frame reference so JAX tracers vaporize instantly
             del frame
 
 compiler_state = CompilerState()
