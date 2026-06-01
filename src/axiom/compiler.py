@@ -70,25 +70,23 @@ class AxiomModel:
 
         return res
 
-    def init(self, *topology: 'Axis') -> 'AxiomModel':
+    def init(self, *topology: 'Axis', **kwargs) -> 'AxiomModel':
         """
         Eagerly initializes the model by running an automatic Ghost Pass.
-        Takes the input topology axes (e.g., ax.b(1), ax.s(12)).
+        Takes the input topology axes and any required kwargs for the forward pass.
         """
         import jax.numpy as jnp
         from .core import Tensor
 
-        # 1. Verify axes have concrete sizes
         for a in topology:
             if not hasattr(a, 'size') or a.size is None:
                 raise ValueError(f"AxiomModel.init() requires strictly sized Axes, got: {a}")
 
-        # 2. Auto-generate the dummy tensor (using int32 to be safe for embeddings)
         shape = tuple(a.size for a in topology)
         dummy_input = Tensor(jnp.zeros(shape, dtype=jnp.int32), *topology)
 
-        # 3. Trigger the eager Ghost Pass to allocate memory
-        _ = self(dummy_input)
+        # Pass kwargs into the Ghost Pass
+        _ = self(dummy_input, **kwargs)
 
         return self
 
@@ -199,8 +197,9 @@ def _trigger_ghost_pass(fn, *args, **kwargs):
 
 
 class AxiomJitWrapper:
-    def __init__(self, fn):
+    def __init__(self, fn, static_argnames=None):
         self.fn = fn
+        self.static_argnames = static_argnames
         self._jitted_fn = None
 
     def __call__(self, *args, **kwargs):
@@ -209,7 +208,8 @@ class AxiomJitWrapper:
 
         # 2. Compile and execute the pure JAX function
         if self._jitted_fn is None:
-            self._jitted_fn = jax.jit(self.fn)
+            # Pass static_argnames down to JAX
+            self._jitted_fn = jax.jit(self.fn, static_argnames=self.static_argnames)
 
         return self._jitted_fn(*args, **kwargs)
 
@@ -263,9 +263,14 @@ class AxiomGradWrapper:
 # 3. THE PUBLIC API
 # ==========================================
 
-def jit(fn):
+def jit(fn=None, *, static_argnames=None):
     """Compiles an Axiom training step or mathematical function."""
-    return AxiomJitWrapper(fn)
+    if fn is None:
+        # Called as @ax.jit(static_argnames=[...])
+        return lambda f: AxiomJitWrapper(f, static_argnames=static_argnames)
+
+    # Called simply as @ax.jit
+    return AxiomJitWrapper(fn, static_argnames=static_argnames)
 
 
 def value_and_grad(fn=None, has_aux=False):

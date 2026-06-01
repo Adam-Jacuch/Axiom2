@@ -1523,3 +1523,56 @@ def test_native_dropout():
     assert 400 < d1_zeros < 600, f"Dropout rate failed: Expected ~500 dropped, got {d1_zeros}"
 
     print("Axiom-Native Dropout Passed!")
+
+
+def test_jit_static_argnames():
+    print("--- Testing ax.jit with static_argnames ---")
+    from axiom import ax, wrap
+    import jax.numpy as jnp
+    import jax
+    import pytest
+    from axiom.core import compiler_state
+
+    # 1. Reset state
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    ax.b = ax("b", 1)
+    ax.d = ax("d", 4)
+    x = wrap(jnp.ones((1, 4)), ax.b, ax.d)
+
+    # 2. A block that strictly requires static control flow
+    def conditional_block(t, is_train: bool):
+        # This standard Python 'if' will instantly crash JAX if is_train is a Tracer!
+        if is_train:
+            return t * 2.0
+        else:
+            return t * 0.5
+
+    # Initialize memory
+    model = ax.model(conditional_block).init(ax.b(1), ax.d(4), is_train=True)
+
+    # --- TEST 1: The Dynamic Crash ---
+    @ax.jit
+    def dynamic_step(model, t, is_train):
+        return model(t, is_train)
+
+    # We expect JAX to violently reject this because `is_train` is a dynamic Tracer
+    with pytest.raises(jax.errors.ConcretizationTypeError):
+        _ = dynamic_step(model, x, True)
+
+    print("Dynamic failure successfully caught!")
+
+    # --- TEST 2: The Static Success ---
+    @ax.jit(static_argnames=['is_train'])
+    def static_step(model, t, is_train=True):
+        return model(t, is_train)
+
+    # The compiler should build two completely separate XLA graphs!
+    out_train = static_step(model, x, is_train=True)
+    out_eval = static_step(model, x, is_train=False)
+
+    assert jnp.allclose(out_train.unwrap(), 2.0), "Static arg 'True' branch failed to compile correctly!"
+    assert jnp.allclose(out_eval.unwrap(), 0.5), "Static arg 'False' branch failed to compile correctly!"
+
+    print("Static compilation passed!")
