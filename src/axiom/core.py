@@ -242,14 +242,29 @@ class _AxisNamespace:
         from functools import wraps
 
         def wrapper(func):
+            # A pure inner function that explicitly accepts the parameter dictionary
+            def pure_func(params_dict, *args, **kwargs):
+                # 1. Swap the global state to the explicitly tracked JAX parameters
+                prev_params = getattr(compiler_state, 'params', {})
+                compiler_state.params = params_dict
+
+                try:
+                    res = func(*args, **kwargs)
+                finally:
+                    # 2. Safely restore
+                    compiler_state.params = prev_params
+
+                return res
+
             @wraps(func)
             def inner(*args, **kwargs):
                 if compiler_state.is_initializing:
-                    # Ghost Pass: Execute purely so JAX doesn't inject Tracers!
+                    # Ghost Pass: Execute purely so JAX doesn't inject Tracers
                     return func(*args, **kwargs)
                 else:
-                    # Trace Pass: Apply hardware memory checkpointing
-                    return jax.checkpoint(func)(*args, **kwargs)
+                    # Trace Pass: Explicitly pass the global params through the checkpoint boundary!
+                    # JAX now tracks them as formal inputs, completely preventing the residual leak!
+                    return jax.checkpoint(pure_func)(compiler_state.params, *args, **kwargs)
 
             return inner
 
