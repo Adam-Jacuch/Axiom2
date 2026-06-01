@@ -51,22 +51,21 @@ class CompilerState:
         scope_func = "global"
         target_frame_id = None
 
-        import inspect
-        stack = inspect.stack()
+        import sys
+        # THE FIX: Use lightweight CPython frames instead of the leaky inspect module!
+        frame = sys._getframe(1)
 
         try:
-            alive_frames = {id(f.frame) for f in stack}
-
-            dead_frames = [fid for fid in self.active_frames if fid not in alive_frames]
-            for fid in dead_frames: del self.active_frames[fid]
-
-            for frame_info in stack:
-                filepath = frame_info.filename.replace("\\", "/")
+            # Walk up the frame stack directly
+            while frame:
+                filepath = frame.f_code.co_filename.replace("\\", "/")
                 if "axiom/" not in filepath and "jax/" not in filepath and "optax/" not in filepath:
-                    scope_func = frame_info.function
-                    target_frame_id = id(frame_info.frame)
+                    scope_func = frame.f_code.co_name
+                    target_frame_id = id(frame)  # Store memory address, NOT the frame!
                     break
+                frame = frame.f_back
 
+            # Execution Instance Isolation AND Scope Override
             if self.tied_scope_override:
                 scope_id = self.tied_scope_override
             elif target_frame_id is not None:
@@ -86,11 +85,8 @@ class CompilerState:
                 return p_name
 
         finally:
-            # Annihilate the Python frame reference cycle
-            # This guarantees JAX Tracers are immediately garbage collected.
-            del stack
-            if 'frame_info' in locals():
-                del frame_info
+            # Annihilate the local frame reference so JAX tracers vaporize instantly!
+            del frame
 
 compiler_state = CompilerState()
 
