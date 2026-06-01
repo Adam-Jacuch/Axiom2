@@ -45,48 +45,48 @@ class CompilerState:
         3. If name='...' -> Semantic label in execution scope, auto-append counter.
         4. No arguments -> Default fallback, auto-append counter.
         """
-        import inspect
-
         # 1. Global Tie (Ignore scope, ignore counter)
         if explicit_name is not None and explicit_name.startswith('@'):
             return explicit_name[1:]
 
         # 2. Local Scope Resolution
         scope_func = "global"
-        target_frame = None
+        target_frame_id = None
+
+        import inspect
         stack = inspect.stack()
-        alive_frames = {f.frame for f in stack}
+
+        # THE FIX: Store memory addresses, NOT frame objects!
+        alive_frames = {id(f.frame) for f in stack}
 
         # Lazy Cleanup: Prevent memory leaks and address recycling
-        dead_frames = [f for f in self.active_frames if f not in alive_frames]
-        for f in dead_frames: del self.active_frames[f]
+        dead_frames = [fid for fid in self.active_frames if fid not in alive_frames]
+        for fid in dead_frames: del self.active_frames[fid]
 
-        # Walk up the stack to find the user's function, ignoring JAX/Optax/Axiom internals
+        # Walk up the stack to find the user's function
         for frame_info in stack:
             filepath = frame_info.filename.replace("\\", "/")
             if "axiom/" not in filepath and "jax/" not in filepath and "optax/" not in filepath:
                 scope_func = frame_info.function
-                target_frame = frame_info.frame
+                target_frame_id = id(frame_info.frame)  # Extract the integer ID
                 break
 
-        # THE MISSING BLOCK: Execution Instance Isolation AND Scope Override
+        # 3. Execution Instance Isolation AND Scope Override
         if self.tied_scope_override:
             scope_id = self.tied_scope_override
-        elif target_frame is not None:
-            if target_frame not in self.active_frames:
+        elif target_frame_id is not None:
+            if target_frame_id not in self.active_frames:
                 count = self.func_calls.get(scope_func, 0)
                 self.func_calls[scope_func] = count + 1
-                self.active_frames[target_frame] = f"{scope_func}_{count}"
-            scope_id = self.active_frames[target_frame]
+                self.active_frames[target_frame_id] = f"{scope_func}_{count}"
+            scope_id = self.active_frames[target_frame_id]
         else:
             scope_id = scope_func
 
-        # 3. Deterministic Naming & Tying Logic
+        # 4. Deterministic Naming & Tying Logic
         if explicit_name:
-            # If explicit tie is provided, use it exactly as the identifier
             return f"{scope_id}/{explicit_name}"
         else:
-            # Otherwise, use the semantic name (or fallback) + deterministic counter
             p_name = f"{scope_id}/{fallback_prefix}_{self.param_counter}"
             self.param_counter += 1
             return p_name
