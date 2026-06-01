@@ -1309,6 +1309,11 @@ class Tensor(NNTensorStubs):
     """The core Axiom Tensor wrapper enforcing named-axis topologies."""
 
     def __init__(self, raw_tensor: Any, *axes: Axis):
+        import jax.numpy as jnp
+
+        if not hasattr(raw_tensor, "shape") or not hasattr(raw_tensor, "dtype"):
+            raw_tensor = jnp.asarray(raw_tensor)
+
         self._tensor = raw_tensor
         self._axes = axes
         self._validate_topology()
