@@ -247,9 +247,23 @@ class _AxisNamespace:
 
     @property
     def remat(self):
-        """Gradient checkpointing for massive memory savings during backprop."""
+        """Gradient checkpointing (Transparent during Ghost Pass to prevent Tracer leaks)."""
         import jax
-        return jax.checkpoint
+        from functools import wraps
+
+        def wrapper(func):
+            @wraps(func)
+            def inner(*args, **kwargs):
+                if compiler_state.is_initializing:
+                    # Ghost Pass: Execute purely so JAX doesn't inject Tracers!
+                    return func(*args, **kwargs)
+                else:
+                    # Trace Pass: Apply hardware memory checkpointing
+                    return jax.checkpoint(func)(*args, **kwargs)
+
+            return inner
+
+        return wrapper
 
     def __getattr__(self, name: str) -> Axis:
         return Axis(name)
@@ -1252,6 +1266,8 @@ class Bundle:
         prev_override = compiler_state.tied_scope_override
         start_counter = compiler_state.param_counter
 
+        end_counter = start_counter
+
         try:
             # 1. The Ghost Pass
             compiler_state.tied_scope_override = repeat_scope
@@ -1324,20 +1340,20 @@ class Tensor(NNTensorStubs):
         self._param_name = true_name
 
         import jax
-
-        # Are we actively inside a JAX trace (e.g., @ax.jit)?
         is_tracing = isinstance(self.unwrap(), jax.core.Tracer)
 
-        # THE FIX: Allow allocation during Ghost Pass OR during Pure Eager Execution!
-        if compiler_state.is_initializing or not is_tracing:
+        # THE FIX: Absolute priority to is_tracing! Never allocate Tracers.
+        if is_tracing:
+            if true_name not in compiler_state.params:
+                raise RuntimeError(
+                    f"Axiom Tracer Leak Prevention: Parameter '{true_name}' was requested during JAX tracing, "
+                    f"but was not allocated eagerly! You must initialize your model with a dummy forward pass "
+                    f"BEFORE compiling it."
+                )
+        else:
+            # Eager execution: Safe to allocate memory
             if true_name not in compiler_state.params:
                 compiler_state.params[true_name] = self.unwrap()
-        elif true_name not in compiler_state.params:
-            # Trace Pass: Prevent Tracers from leaking into global memory!
-            raise RuntimeError(
-                f"Axiom Tracer Leak Prevention: Parameter '{true_name}' was requested during JAX tracing, "
-                f"but was not allocated during the Ghost Pass! Ensure your stack frames are deterministic."
-            )
 
         return Tensor(compiler_state.params[true_name], *self.topology)
 
@@ -1365,6 +1381,8 @@ class Tensor(NNTensorStubs):
         repeat_scope = f"repeat_block_{compiler_state.param_counter}"
         prev_override = compiler_state.tied_scope_override
         start_counter = compiler_state.param_counter
+
+        end_counter = start_counter
 
         try:
             # 1. The Ghost Pass
