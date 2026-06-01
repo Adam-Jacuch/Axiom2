@@ -283,27 +283,16 @@ def grad(fn=None, has_aux=False):
 
 
 def apply_updates(model: AxiomModel, grads: Any, optimizer: Any, opt_state: Any) -> Tuple[AxiomModel, Any]:
-    """
-    Orthogonal, functional optimizer step.
-    Returns a newly updated AxiomModel PyTree and the new optimizer state.
-    """
     import optax
 
-    # QoL check: If the user surgically modified grads and passed a raw dictionary,
-    # we dynamically wrap it back into an AxiomModel so Optax's tree_map doesn't crash!
     if isinstance(grads, dict):
         grads = AxiomModel(model.fn, grads)
 
-    # 1. Initialize optimizer state dynamically if this is the first step
-    # We pass the full PyTree model here!
-    if opt_state is None:
+    if opt_state is None: # not recommended; fallback
         opt_state = optimizer.init(model)
 
-    # 2. Calculate updates and apply them natively on the PyTrees!
     updates, new_opt_state = optimizer.update(grads, opt_state, model)
     new_model = optax.apply_updates(model, updates)
-
-    # 3. Return the new Immutable PyTree
     return new_model, new_opt_state
 
 
