@@ -336,8 +336,8 @@ def test_implicit_parameters():
 
     # FIX: Read from compiler_state.params instead of state.params!
     print(f"State Manager Params: {list(compiler_state.params.keys())}")
-    assert "gated_residual_block_0/gate_0" in compiler_state.params
-    assert "gated_residual_block_0/bias_1" in compiler_state.params
+    assert "gated_residual_block/gate_0" in compiler_state.params
+    assert "gated_residual_block/bias_1" in compiler_state.params
     print("Implicit parameters and Invisible Scope passed!\n")
 
 
@@ -847,8 +847,8 @@ def test_dynamic_axiom_nn_routing():
     assert out.topology == (ax.b(2), ax.s(4), ax.d(16))
 
     # Notice the _0 prefix! This proves execution isolation works.
-    assert "test_dynamic_axiom_nn_routing_0/gamma_0" in compiler_state.params
-    assert "test_dynamic_axiom_nn_routing_0/beta_1" in compiler_state.params
+    assert "test_dynamic_axiom_nn_routing/gamma_0" in compiler_state.params
+    assert "test_dynamic_axiom_nn_routing/beta_1" in compiler_state.params
     print("Dynamic Axiom NN routing and parameter allocation passed!\n")
 
 
@@ -879,7 +879,7 @@ def test_1d_convolution():
     out = unfolded.w.d.proj(ax.out_d(8), bias=True)
 
     assert out.topology == (ax.b(2), ax.s(5), ax.out_d(8))
-    assert "test_1d_convolution_0/proj_w_0" in compiler_state.params
+    assert "test_1d_convolution/proj_w_0" in compiler_state.params
     print("1D Convolution pipeline passed!\n")
 
 
@@ -1045,7 +1045,7 @@ def test_to_jax_and_manual_vjp():
     params, apply_fn = to_jax(model)
 
     assert isinstance(params, dict)
-    assert "my_net_0/proj_w_0" in params
+    assert "my_net/proj_w_0" in params
 
     # 4. Perform a manual JAX Vector-Jacobian Product (VJP)
     import jax
@@ -1066,7 +1066,7 @@ def test_to_jax_and_manual_vjp():
     grad_params, grad_inputs = vjp_fn(cotangent)
 
     # Validate the gradients were successfully computed
-    assert "my_net_0/proj_w_0" in grad_params
+    assert "my_net/proj_w_0" in grad_params
     assert grad_inputs.topology == (ax.b(2), ax.d(4))
 
     print("to_jax and manual VJP passed!\n")
