@@ -1468,3 +1468,58 @@ def test_scalable_encoder_remat():
     assert out.topology == (ax.b, ax.d), "Encoder topology mismatch!"
     assert out.unwrap().dtype == jnp.bfloat16, "Rematerialized encoder failed to retain bfloat16 casting!"
     print("Rematerialized Mixed Precision Encoder Passed!")
+
+
+def test_native_dropout():
+    print("--- Testing Axiom-Native Dropout ---")
+    from axiom import ax, nn, wrap
+    import jax.numpy as jnp
+    from axiom.core import compiler_state
+
+    # 1. Reset state to ensure clean test environment
+    compiler_state.params.clear()
+    compiler_state.reset_pass_state()
+
+    # We use a large feature dim to guarantee statistical differences
+    ax.b = ax("b", 1)
+    ax.d = ax("d", 1000)
+
+    # Input is pure ones so scaling is easy to verify
+    x = wrap(jnp.ones((1, 1000)), ax.b, ax.d)
+
+    # --- TEST 1: Eval Mode (Identity) ---
+    out_eval = nn.dropout(x, rate=0.5, training=False)
+    assert jnp.allclose(out_eval.unwrap(), 1.0), "Eval mode must not alter inputs!"
+
+    # --- TEST 2: Training Mode (Compiled Uniqueness & Scaling) ---
+    def drop_block(t):
+        d1 = nn.dropout(t, rate=0.5, training=True)
+        d2 = nn.dropout(t, rate=0.5, training=True)
+        return d1, d2
+
+    # Initialize the model to trigger the Ghost Pass (param_counter runs)
+    model = ax.model(drop_block).init(ax.b(1), ax.d(1000))
+
+    # Compile it to XLA to prove the PRNG fold_in survives Tracing!
+    @ax.jit
+    def run_drops(model, t):
+        return model(t)
+
+    d1, d2 = run_drops(model, x)
+
+    # Verify Scaling:
+    # Since inputs were 1.0, and rate=0.5, kept values must be 1.0 / 0.5 = 2.0
+    assert jnp.max(d1.unwrap()) == 2.0, "Dropout failed to properly scale retained values!"
+    assert jnp.max(d2.unwrap()) == 2.0, "Dropout failed to properly scale retained values!"
+
+    # Verify Uniqueness:
+    # If the PRNG trap caught us, d1 and d2 would be identical.
+    # If they are different, their absolute difference sum will be massive.
+    diff = jnp.abs(d1.unwrap() - d2.unwrap()).sum()
+    assert diff > 0, "PRNG TRACER TRAP! Both dropout layers generated the exact same mask!"
+
+    # Ensure they drop roughly ~50% of the neurons (statistical sanity check)
+    d1_zeros = jnp.sum(d1.unwrap() == 0.0)
+    assert 400 < d1_zeros < 600, f"Dropout rate failed: Expected ~500 dropped, got {d1_zeros}"
+
+    print("Axiom-Native Dropout Passed!")
