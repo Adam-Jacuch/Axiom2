@@ -301,10 +301,11 @@ def apply_updates(model: AxiomModel, grads: Any, optimizer: Any, opt_state: Any)
     return new_model, new_opt_state
 
 
-def to_jax(model, *init_axes: 'Axis'):
+def to_jax(model, *init_axes: 'Axis', **kwargs):
     """
     Converts an AxiomModel into a pure JAX (params, apply_fn) paradigm.
     If init_axes are provided, it automatically initializes the model weights.
+    Accepts arbitrary **kwargs (e.g., training=True) for the initialization pass.
     """
     import inspect
 
@@ -326,7 +327,9 @@ def to_jax(model, *init_axes: 'Axis'):
 
         # Synthesize a dummy tensor and trigger the Ghost Pass internally!
         dummy_input = Tensor(jnp.zeros(shape), *init_axes)
-        _ = model(dummy_input)
+
+        # THE FIX: Pass kwargs into the initialization pass!
+        _ = model(dummy_input, **kwargs)
 
     if not model.is_initialized:
         raise ValueError(
@@ -337,11 +340,11 @@ def to_jax(model, *init_axes: 'Axis'):
     # The parameters are already a flat dictionary of raw jax.Arrays!
     params = model.params.copy()
 
-    def apply_fn(params_dict, *args, **kwargs):
+    def apply_fn(params_dict, *args, **apply_kwargs):
         from .core import decay_monads, compiler_state
 
         args = decay_monads(args)
-        kwargs = decay_monads(kwargs)
+        apply_kwargs = decay_monads(apply_kwargs)
 
         # 1. Snapshot the state
         prev_params = getattr(compiler_state, 'params', {})
@@ -357,7 +360,7 @@ def to_jax(model, *init_axes: 'Axis'):
 
         # 3. Execute and safely restore
         try:
-            res = model.fn(*args, **kwargs)
+            res = model.fn(*args, **apply_kwargs)
         finally:
             compiler_state.param_counter = prev_counter
             compiler_state.active_frames = prev_frames
