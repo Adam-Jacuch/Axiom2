@@ -80,7 +80,8 @@ def bce_with_logits(logits: Tensor, targets: Tensor, reduction: str = 'mean') ->
     loss = max_val - (logits * targets) + log_weight
     return _apply_reduction(loss, reduction)
 
-def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor, reduction: str = 'mean') -> Tensor:
+def cross_entropy_loss(logits: 'TargetedTensor', targets: 'Tensor', smoothing: float = 0.0,
+                       reduction: str = 'mean') -> 'Tensor':
     """
     Cross entropy over a targeted class axis.
 
@@ -112,6 +113,9 @@ def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor, reduction: str
             f"got {[a.name for a in logits.target_axes]}."
         )
 
+    if not 0.0 <= smoothing < 1.0:
+        raise ValueError(f"Smoothing must be in range [0.0, 1.0), got {smoothing}")
+
     x = logits.tensor
     class_ax = logits.target_axes[0]
 
@@ -122,6 +126,7 @@ def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor, reduction: str
         )
 
     class_idx = x.topology.index(class_ax)
+    num_classes = x.unwrap().shape[class_idx]
     log_probs_raw = jax.nn.log_softmax(x.unwrap(), axis=class_idx)
 
     # Topology after removing the class axis.
@@ -130,8 +135,12 @@ def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor, reduction: str
     # Dense / one-hot case: targets include the class axis.
     if class_ax in targets.topology:
         target_raw = targets._align_to(x.topology)
+
+        if smoothing > 0.0:
+            target_raw = target_raw * (1.0 - smoothing) + (smoothing / num_classes)
+
         loss_raw = -(target_raw * log_probs_raw).sum(axis=class_idx)
-        return Tensor(loss_raw, *out_topology)
+        return _apply_reduction(Tensor(loss_raw, *out_topology), reduction)
 
     # Sparse integer-label case: targets do NOT include the class axis.
     target_raw = targets._align_to(out_topology).astype(jnp.int32)
@@ -141,6 +150,11 @@ def cross_entropy_loss(logits: 'TargetedTensor', targets: Tensor, reduction: str
 
     loss_raw = -jnp.take_along_axis(log_probs_raw, gather_idx, axis=class_idx)
     loss_raw = jnp.squeeze(loss_raw, axis=class_idx)
+
+    # Apply O(1) memory-efficient label smoothing via mathematical expansion
+    if smoothing > 0.0:
+        mean_log_prob = log_probs_raw.mean(axis=class_idx)
+        loss_raw = (1.0 - smoothing) * loss_raw - smoothing * mean_log_prob
 
     return _apply_reduction(Tensor(loss_raw, *out_topology), reduction)
 
