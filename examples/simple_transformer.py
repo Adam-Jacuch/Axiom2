@@ -4,7 +4,7 @@ import jax, optax
 def mha(x: Tensor, heads=8):
     """mha: multi head attention (prefer gqa for causal inference)"""
     q, k, v = (x & x & x).d.proj().d.split(ax.h(heads), ax.dh)
-    k, q = (k & q).dh.rope(seq_ax=ax.s)
+    k, q = (k & q).dh.rms_norm().dh.rope(seq_ax=ax.s)
     out = nn.flash_attention(q, k, v, seq_ax=ax.s, head_ax=ax.h)
     return out.h.dh.proj(ax.d(x.d))
 

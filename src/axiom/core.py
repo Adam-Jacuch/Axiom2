@@ -1014,8 +1014,8 @@ class TargetedBundle(NNTargetedBundleStubs):
     def gate(self, init=None, tie: Optional[str] = None) -> 'Bundle':
         return Bundle(*[TargetedTensor(t, self.target_axes).gate(init=init, tie=tie) for t in self.bundle.tensors])
 
-    def pw(self, func, tie: Optional[str] = None, **kwargs) -> Tuple['Tensor', ...]:
-        return tuple(TargetedTensor(t, self.target_axes).pw(func, tie=tie, **kwargs) for t in self.bundle.tensors)
+    def pw(self, func, tie: Optional[str] = None, **kwargs) -> 'Bundle':
+        return Bundle(*[TargetedTensor(t, self.target_axes).pw(func, tie=tie, **kwargs) for t in self.bundle.tensors])
 
     def merge(self, new_axis: Axis) -> 'Bundle':
         """
@@ -1131,10 +1131,9 @@ class TargetedBundle(NNTargetedBundleStubs):
 
             return final_carry, y_seq
 
-    def rename(self, *new_axes: Axis) -> Tuple['Tensor', ...]:
+    def rename(self, *new_axes: 'Axis') -> 'Bundle':
         if len(new_axes) == 1: new_axes = new_axes * len(self.bundle.tensors)
-        return tuple(
-            TargetedTensor(t, self.target_axes).rename(new_ax) for t, new_ax in zip(self.bundle.tensors, new_axes))
+        return Bundle(*[TargetedTensor(t, self.target_axes).rename(new_ax) for t, new_ax in zip(self.bundle.tensors, new_axes)])
 
     def join(self) -> 'TargetedTensor':
         import jax.numpy as jnp
@@ -1168,15 +1167,15 @@ class TargetedBundle(NNTargetedBundleStubs):
 
         return Tensor(jnp.concatenate(raw_arrays, axis=ax_idx), *new_topology)
 
-    def pad(self, *pad_widths: Tuple[int, int], fill: float = 0.0) -> Tuple['Tensor', ...]:
-        return tuple(TargetedTensor(t, self.target_axes).pad(*pad_widths, fill=fill) for t in self.bundle.tensors)
+    def pad(self, *pad_widths: Tuple[int, int], fill: float = 0.0) -> 'Bundle':
+        return Bundle(*[TargetedTensor(t, self.target_axes).pad(*pad_widths, fill=fill) for t in self.bundle.tensors])
 
-    def mask(self, func, fill: float = 0.0) -> Tuple['Tensor', ...]:
-        return tuple(TargetedTensor(t, self.target_axes).mask(func, fill=fill) for t in self.bundle.tensors)
+    def mask(self, func, fill: float = 0.0) -> 'Bundle':
+        return Bundle(*[TargetedTensor(t, self.target_axes).mask(func, fill=fill) for t in self.bundle.tensors])
 
-    def vmask(self, func, fill: float = 0.0) -> Tuple['Tensor', ...]:
+    def vmask(self, func, fill: float = 0.0) -> 'Bundle':
         bool_mask = func(*[t.unwrap() for t in self.bundle.tensors])
-        return tuple(Tensor(jnp.where(bool_mask, fill, t.unwrap()), *t.topology) for t in self.bundle.tensors)
+        return Bundle(*[Tensor(jnp.where(bool_mask, fill, t.unwrap()), *t.topology) for t in self.bundle.tensors])
 
     def __iter__(self):
         """Allows Pythonic unpacking across a bundle: (q & k).heads"""
