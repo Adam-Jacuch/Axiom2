@@ -13,7 +13,11 @@ dependencies = [
     "optax>=0.1.5",
 ]
 
+[project.scripts]
+axiom-oracle = "axiom.mcp:main"
+
 [project.optional-dependencies]
+ai = ["mcp>=1.0.0"]
 dev = [
     "pytest>=7.0",
     "pyright>=1.1"

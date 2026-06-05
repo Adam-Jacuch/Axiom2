@@ -138,6 +138,33 @@ for step in range(100):
 
 ---
 
+## 🧠 Axiom AI Oracle (MCP Server)
+
+Axiom includes a native **Model Context Protocol (MCP)** server. Instead of fighting with AI hallucinations, you can hook your IDE directly into the Axiom JAX compiler. 
+
+When installing from GitHub:
+```bash
+pip install "axiom-jax[cuda13,ai] @ git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)"
+```
+
+When activated, your AI assistant (Claude, GPT, Gemini) gains the ability to:
+* **Mathematically verify matrix shapes** before writing code.
+* **Profile XLA TPU/GPU memory** to prevent HBM spills.
+* **Detect Tracer Leaks** and verify state-machine purity via the JAX tape.
+* **Calculate Compute-per-Neuron (FLOPs)** for custom architectures.
+
+### How to Activate in Cursor / Windsurf
+1. Ensure you installed Axiom with the AI flag (e.g., `pip install -e ".[ai]"`).
+2. Open your IDE Settings and navigate to **MCP Servers**.
+3. Add a new server:
+   * **Name:** `Axiom Oracle`
+   * **Type:** `command`
+   * **Command:** `axiom-oracle` (or `uv run axiom-oracle`)
+
+*That's it. Ask your AI to "Write an associative scan block and check the compute density," and watch it talk to the framework natively.*
+
+---
+
 ## 🤝 Pure JAX Interop
 
 Don't want to be locked into an ecosystem? Axiom models can be instantly exported into pure JAX `(params, apply_fn)` paradigms at any time.
