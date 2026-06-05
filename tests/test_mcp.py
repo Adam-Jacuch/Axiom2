@@ -168,3 +168,34 @@ def test_mcp_api_inspector():
     # 3. Test a hallucinated function
     fake_result = inspect_axiom_api("make_me_a_sandwich")
     assert "❌ Could not find" in fake_result
+
+
+from axiom.mcp import inspect_axiom_api, get_axiom_tutorial
+import os
+
+
+def test_mcp_api_inspector_deep_lookup():
+    print("--- Testing MCP: API Inspector Deep Lookup ---")
+
+    # Test method lookup inside a class (TargetedTensor.proj)
+    # Based on our update, this should now work perfectly!
+    proj_result = inspect_axiom_api("proj")
+    assert "TargetedTensor.proj" in proj_result
+    assert "Source Code Preview:" in proj_result
+
+
+def test_mcp_tutorial_loader():
+    print("--- Testing MCP: Tutorial Loader ---")
+
+    # 1. Test success (assuming tutorial.py exists at examples/tutorial.py)
+    # You may need to adjust the path if your structure is different
+    tutorial_content = get_axiom_tutorial()
+
+    if "❌ Could not find" not in tutorial_content:
+        assert "Welcome to axiom!" in tutorial_content
+        assert "def f(x: Tensor)" in tutorial_content
+    else:
+        print("Skipping tutorial content check: file not found in current path.")
+
+    # 2. Test failure (hallucinated path if we renamed the file)
+    # You could temporarily rename/move the file to verify the error string

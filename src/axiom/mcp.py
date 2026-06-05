@@ -566,6 +566,108 @@ def inspect_axiom_api(target_name: str) -> str:
         return f"API Inspection Failed:\n{str(e)}"
 
 
+@mcp.tool()
+def axiom_idioms_and_best_practices() -> str:
+    """
+    AI usage: Call this BEFORE writing full model architectures to learn the "Axiom Way".
+    Contains framework philosophy, parallel bundle syntax, RL loops, SSMs, and monad patching.
+    """
+    return """
+    # The Axiom Philosophy & Best Practices
+    Axiom is a strictly typed, named-axis functional eDSL. Do not write PyTorch/Flax-style object-oriented boilerplate. Models are pure functions. Parameters allocate themselves implicitly.
+
+    ## 1. Topologies & Bundles over Manual Projections
+    BAD (PyTorch style): 
+    q, k, v = x.proj(), x.proj(), x.proj()
+
+    GOOD (Axiom Bundles):
+    # Execute parallel operations across multiple tensors at once using `&`
+    q, k, v = (x & x & x).d.proj().d.split(ax.h(heads), ax.hd)
+
+    ## 2. Configs Should Hold Axis Objects, Not Integers
+    BAD: `@dataclass class Config: d_model: int = 384`
+    GOOD: `@dataclass class Config: d: Axis = ax.d(384); s: Axis = ax.s(512)`
+
+    ## 3. Trust ax.to_jax and ax.model for Auto-Scoping
+    Do NOT manually number tied weights (e.g., `tie=f"attn_norm_{layer}"`). 
+    When looping over a block `for _ in range(depth): x = block(x)`, Axiom automatically handles hierarchical scoping of the parameter dictionary. Write the block purely.
+
+    ## 4. State Space Models (SSMs) & Recurrence
+    Axiom supports native associative scans and recurrent loops. 
+    ```python
+    def ssm(x: Tensor, depth=8):
+        for _ in range(depth):
+            # Native parallel scan over the sequence axis
+            s, _ = (x.d.rms_norm() & x.d.proj().d.rms_norm()).s.scan(nn.ssm_op, associative=True)
+            x = x + swiglu((x + s).d.rms_norm())
+        return x
+    ```
+
+    ## 5. Advanced Topologies: Tying, Masks, and Repeats
+    ```python
+    # Weight Tying: 'local' ties within the function, '@global' ties anywhere
+    x = x + x.d.proj(tie="local").d.silu().d.proj(tie="@global")
+
+    # Masks & VMasks (Functional filtering)
+    x = x.d.mask(lambda idx: idx < 5, fill=0.0)
+    x = x.d.vmask(lambda val: val < 0.1, fill=0.0)
+
+    # Native Repeat (Loops a function, implicitly tying weights between calls)
+    x = x.repeat(lambda t: t + t.d.layer_norm().d.proj(), times=3)
+    ```
+
+    ## 6. Sliced Monads (In-Place Patching)
+    Axiom allows safe, functional mutation of tensor slices.
+    ```python
+    def patch_mutation(x: Tensor) -> Tensor:
+        patch = x.s[:10] # Returns a SlicedMonad
+        patch = patch.d.layer_norm().d.proj()
+        return patch[:]  # Stitch back into parent tensor in-place
+    ```
+
+    ## 7. Reinforcement Learning (Actor-Critic Loops)
+    Axiom works beautifully for RL. Treat environments as registered PyTrees and use `ax.model` for networks.
+    ```python
+    @ax.model
+    def actor(x: Tensor):
+        # Outputs unnormalized logits for 5 discrete directions
+        return x.d.proj(ax.h(32)).h.silu().h.proj(ax.a(5))
+
+    @ax.model
+    def critic(x: Tensor):
+        # Evaluates state value, summing v(1) to return clean topology (b)
+        return x.d.proj(ax.h(32)).h.silu().h.proj(ax.v(1)).v.sum()
+
+    # Inside the ax.jit train step:
+    a = actor(x).stop_grad().a.sample()
+
+    def actor_loss(a_model):
+        logits = a_model(inputs)
+        entropy = logits.a.pw(lambda v: jax.nn.softmax(v) * jax.nn.log_softmax(v)).a.sum().b.t.mean()
+        return nn.reinforce(logits.a, actions, advantages) + entropy * 0.01
+    ```
+    """
+
+
+@mcp.tool()
+def get_axiom_tutorial() -> str:
+    """
+    AI usage: Call this to read the official Axiom tutorial code.
+    Use this to see how Axiom handles training loops, functional mutation, and advanced topology.
+    """
+    try:
+        # Assumes the tutorial is in the root/examples directory relative to the project
+        import os
+        path = "examples/tutorial.py"
+        if not os.path.exists(path):
+            return f"❌ Could not find tutorial at {path}. Make sure you are running from the project root."
+
+        with open(path, "r") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading tutorial: {str(e)}"
+
+
 def main():
     print("Starting Axiom MCP Oracle...")
     mcp.run()
