@@ -646,6 +646,30 @@ def axiom_idioms_and_best_practices() -> str:
         entropy = logits.a.pw(lambda v: jax.nn.softmax(v) * jax.nn.log_softmax(v)).a.sum().b.t.mean()
         return nn.reinforce(logits.a, actions, advantages) + entropy * 0.01
     ```
+    
+    ## 8. Dataclasses & Configs (No Verbose Boilerplate)
+    Axiom axes are safe to instantiate directly in configs. NEVER use `field(default_factory=...)`. Do not write `__post_init__` validation loops. Keep it elegant.
+    BAD: 
+    @dataclass
+    class Config:
+        x: Axis = field(default_factory=lambda: Axis("x", 256))
+        
+    GOOD:
+    @dataclass
+    class Config:
+        x: Axis = ax.x(256)
+        c: Axis = ax.c(128)
+
+    ## 9. Hypernetworks & Multi-Axis Projections
+    When generating weights for a hypernetwork, do NOT multiply axis sizes together (e.g., `x.size * h.size`) and split them later. Axiom's `.proj()` handles multi-axis generation natively.
+    BAD:
+    # Flat math and manual splitting
+    w1 = g.z.proj(Axis("w1", cfg.x.size * cfg.h.size)).w1.split(cfg.x, cfg.h)
+    
+    GOOD:
+    # Direct topological projection
+    w1 = g.z.proj(cfg.x, cfg.h)
+    return (x @ w1 + b1).h.silu()
     """
 
 
