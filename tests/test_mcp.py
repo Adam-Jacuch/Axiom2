@@ -199,3 +199,68 @@ def test_mcp_tutorial_loader():
 
     # 2. Test failure (hallucinated path if we renamed the file)
     # You could temporarily rename/move the file to verify the error string
+
+
+from axiom.mcp import axiom_scope_debugger, axiom_anti_pattern_scanner, scan_contract_validator
+
+
+def test_mcp_scope_debugger():
+    print("--- Testing MCP: Scope Debugger ---")
+    topology_dict = {"x": [("b", 1), ("s", 12), ("d", 64)]}
+
+    # Test an architecture that ties weights (it should only allocate one projection)
+    code = "x.d.proj(ax.h(32), tie='shared_proj') + x.d.proj(ax.h(32), tie='shared_proj')"
+
+    result = axiom_scope_debugger(code, topology_dict)
+
+    assert "Axiom Scope & Parameter Allocation Tree" in result
+    assert "shared_proj" in result
+    # 64 in * 32 out + 32 bias = 2,080. If it allocated twice, it would be 4,160.
+    assert "2,080" in result
+
+
+def test_mcp_anti_pattern_scanner():
+    print("--- Testing MCP: Anti-Pattern Scanner ---")
+
+    # 1. Test perfectly clean code
+    clean_code = "q, k, v = (x & x & x).d.proj(ax.h(8), ax.hd(64))"
+    clean_result = axiom_anti_pattern_scanner(clean_code)
+    assert "✅ Code passes static analysis" in clean_result
+
+    # 2. Test the verbose topology walk hallucination
+    bad_topology_code = "b = next(a for a in x.topology if a.name == 'b')"
+    bad_top_result = axiom_anti_pattern_scanner(bad_topology_code)
+    assert "❌ Anti-Pattern Detected: Verbose topology walk" in bad_top_result
+
+    # 3. Test the PyTorch-style math projection hallucination
+    bad_math_code = "w = x.d.proj(ax.a(x.size * h.size))"
+    bad_math_result = axiom_anti_pattern_scanner(bad_math_code)
+    assert "❌ Anti-Pattern Detected: Mathematical sizing in projections" in bad_math_result
+
+
+def test_mcp_scan_contract_validator():
+    print("--- Testing MCP: Scan Contract Validator ---")
+
+    carry_top = {"c": [("b", 1), ("d", 64)]}
+    token_top = {"t": [("b", 1), ("d", 64)]}
+
+    # 1. Test a valid Axiom scan contract: returns (next_carry, (output_tuple,))
+    valid_step = """
+def step(c, t):
+    next_c = c + t
+    out = next_c.d.silu()
+    return next_c, (out,)
+"""
+    valid_result = scan_contract_validator(valid_step, carry_top, token_top)
+    assert "✅ Scan Contract Verified!" in valid_result
+    assert "📥 Carry Output" in valid_result
+
+    # 2. Test an invalid contract (e.g., returning a single tensor instead of a tuple)
+    invalid_step = """
+def step(c, t):
+    # Forgetting to wrap the output in a tuple!
+    return c + t 
+"""
+    invalid_result = scan_contract_validator(invalid_step, carry_top, token_top)
+    assert "❌ Contract Violation" in invalid_result
+    assert "tuple of length 2" in invalid_result

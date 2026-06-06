@@ -13,6 +13,23 @@ from axiom import ax, nn
 mcp = FastMCP("Axiom-Oracle")
 
 
+def smart_eval(code: str, env: dict):
+    """Safely evaluates both single-line expressions and multi-line blocks."""
+    # Secure the environment if not already done
+    if "__builtins__" not in env:
+        env["__builtins__"] = {}
+
+    try:
+        # Use env as the single unified globals dictionary to prevent lambda scoping errors
+        return eval(code, env)
+    except SyntaxError:
+        # If it's multi-line, wrap it in a dummy function and execute it
+        wrapped_code = "def _mcp_dynamic_wrapper():\n" + "\n".join(
+            "    " + line for line in code.splitlines()) + "\n_mcp_result = _mcp_dynamic_wrapper()"
+        exec(wrapped_code, env)
+        return env.get("_mcp_result", None)
+
+
 @mcp.tool()
 def get_active_parameters() -> str:
     """
@@ -60,11 +77,10 @@ def axiom_ghost_pass_oracle(code_snippet: str, input_topology: dict) -> str:
                 shape.append(ax_size)
 
             # Create a zero-filled tensor safe for index operations
-            local_context[var_name] = Tensor(jnp.zeros(shape, dtype=jnp.int32), *axes)
+            local_context[var_name] = Tensor(jnp.zeros(shape, dtype=jnp.float32), *axes)
 
         # 4. Evaluate the AI's proposed code!
-        # We use eval() because we expect a pure mathematical expression.
-        result = eval(code_snippet, {"__builtins__": {}}, local_context)
+        result = smart_eval(code_snippet, local_context)
 
         # 5. Extract and return the mathematical proof of the shape
         if hasattr(result, 'topology'):
@@ -117,7 +133,7 @@ def tracer_leak_autopsy(code_snippet: str, input_topology: dict) -> str:
             })
 
             # Pass `env` as the SECOND argument (globals)
-            res = eval(code_snippet, env)
+            res = smart_eval(code_snippet, env)
 
             return res.unwrap() if hasattr(res, 'unwrap') else res
 
@@ -170,7 +186,7 @@ def xla_memory_interrogator(code_snippet: str, input_topology: dict) -> str:
         def _compile_fn(*args):
             env = dict(zip(input_topology.keys(), args))
             env.update({"ax": ax, "nn": nn, "jnp": jnp})
-            res = eval(code_snippet, {"__builtins__": {}}, env)
+            res = smart_eval(code_snippet, env)
             # Must return pure JAX arrays for XLA compilation
             if hasattr(res, 'tensors'):
                 return tuple(t.unwrap() for t in res.tensors)
@@ -234,7 +250,7 @@ def prng_collision_detector(architecture_code: str, input_topology: dict) -> str
         def _eval_fn(*args):
             env = dict(zip(input_topology.keys(), args))
             env.update({"ax": ax, "nn": nn, "jnp": jnp, "compiler_state": compiler_state})
-            return eval(architecture_code, {"__builtins__": {}}, env)
+            return smart_eval(architecture_code, env)
 
         # 1. Run the Eager Ghost Pass
         compiler_state.is_initializing = True
@@ -367,7 +383,7 @@ def compute_density_profiler(architecture_code: str, input_topology: dict) -> st
         def _eval_fn(*args):
             env = dict(zip(input_topology.keys(), args))
             env.update({"ax": ax, "nn": nn, "jnp": jnp, "compiler_state": compiler_state, "__builtins__": {}})
-            res = eval(architecture_code, env)
+            res = smart_eval(architecture_code, env)
             return res.unwrap() if hasattr(res, 'unwrap') else res
 
         # Eager pass to allocate parameters
@@ -429,7 +445,7 @@ def numerical_stability_oracle(layer_code: str, input_topology: dict) -> str:
             prev_params = getattr(compiler_state, 'params', {})
             compiler_state.params = params_dict
 
-            res = eval(layer_code, env)
+            res = smart_eval(layer_code, env)
             out = res.unwrap() if hasattr(res, 'unwrap') else res
 
             compiler_state.params = prev_params
@@ -472,8 +488,9 @@ def optimal_remat_search(architecture_code: str) -> str:
     # Static Analysis Heuristic
     remat_points = []
 
-    if ".proj" in architecture_code and "inner" in architecture_code:
-        remat_points.append("Wrap the FeedForward/MLP expansion block. (High activation memory, low compute).")
+    # Better Heuristic: Check for chained projections and non-linearities
+    if architecture_code.count(".proj") >= 2 and (".silu" in architecture_code or ".gelu" in architecture_code):
+        remat_points.append("Wrap the FeedForward/Expansion block. (High activation memory, low compute).")
 
     if "softmax" in architecture_code or "attention" in architecture_code.lower():
         remat_points.append("Wrap the Attention Matrix materialization. (Quadratic memory scaling).")
@@ -564,6 +581,172 @@ def inspect_axiom_api(target_name: str) -> str:
 
     except Exception as e:
         return f"API Inspection Failed:\n{str(e)}"
+
+
+@mcp.tool()
+def axiom_scope_debugger(architecture_code: str, input_topology: dict) -> str:
+    """
+    AI usage: Call this to visualize exactly which parameters are allocated during a forward pass.
+    Crucial for debugging weight-tying (e.g., checking if `@global` worked) and scope leaks.
+    """
+    try:
+        compiler_state.reset_pass_state()
+        compiler_state.params.clear()
+        local_context = {"ax": ax, "nn": nn, "jnp": jnp}
+
+        kwargs = {}
+        for var_name, axes_info in input_topology.items():
+            axes = [getattr(ax, ax_name)(size) for ax_name, size in axes_info]
+            shape = [size for _, size in axes_info]
+            kwargs[var_name] = Tensor(jnp.zeros(shape, dtype=jnp.float32), *axes)
+
+        def _eval_fn(*args):
+            env = dict(zip(input_topology.keys(), args))
+            env.update({"ax": ax, "nn": nn, "jnp": jnp, "compiler_state": compiler_state, "__builtins__": {}})
+            res = smart_eval(architecture_code, env)
+            return res.unwrap() if hasattr(res, 'unwrap') else res
+
+        # Run eager pass
+        compiler_state.is_initializing = True
+        _eval_fn(*list(kwargs.values()))
+        compiler_state.is_initializing = False
+
+        params = compiler_state.params
+        if not params:
+            return "🔍 Scope Debugger: No parameters were allocated during this forward pass."
+
+        report = "🔍 Axiom Scope & Parameter Allocation Tree\n\n"
+
+        # Group parameters by their base name to easily spot scope nesting
+        from collections import defaultdict
+        grouped_params = defaultdict(list)
+
+        for name, tensor in params.items():
+            # A rough heuristic to group by the final parameter name vs the scope path
+            parts = name.split('/')
+            base_name = parts[-1]
+            path = "/".join(parts[:-1]) if len(parts) > 1 else "Root"
+            grouped_params[path].append((base_name, tensor.shape))
+
+        total_params = 0
+        for scope_path, items in grouped_params.items():
+            report += f"📁 Scope: `{scope_path}`\n"
+            for base_name, shape in items:
+                size = 1
+                for dim in shape: size *= dim
+                total_params += size
+                report += f"   ├─ 📄 {base_name} | Shape: {shape} | Params: {size:,}\n"
+            report += "\n"
+
+        report += f"Total Allocated Parameters: {total_params:,}\n"
+        return report
+
+    except Exception as e:
+        return f"Scope Debugger Failed:\n{traceback.format_exc()}"
+
+
+@mcp.tool()
+def axiom_anti_pattern_scanner(draft_code: str) -> str:
+    """
+    AI usage: Run this static linter on your drafted Axiom code BEFORE executing the Ghost Pass.
+    It catches verbose topology searches, standard python math inside projections, and bad configs.
+    """
+    import re
+    warnings = []
+
+    # 1. Catching verbose topology walks
+    if re.search(r'\.topology.*if.*name\s*==', draft_code) or "next(a for a in" in draft_code:
+        warnings.append("❌ Anti-Pattern Detected: Verbose topology walk.\n"
+                        "   FIX: Use direct attribute access. Instead of `next(a for a in x.topology if a.name == 'b')`, just use `x.b`.")
+
+    # 2. Catching dataclass field default factories
+    if "field(default_factory" in draft_code:
+        warnings.append("❌ Anti-Pattern Detected: Verbose dataclass fields.\n"
+                        "   FIX: Axes are safe to instantiate directly. Change `x: Axis = field(...)` to `x: Axis = ax.x(256)`.")
+
+    # 3. Catching manual axis size math inside projections
+    if re.search(r'\.proj\([^)]*\.size\s*[*+]', draft_code):
+        warnings.append("❌ Anti-Pattern Detected: Mathematical sizing in projections.\n"
+                        "   FIX: `.proj()` supports multi-axis projection. Instead of `.proj(ax.a(x.size * y.size))`, use `.proj(ax.x, ax.y)`.")
+
+    # 4. Catching string-concatenated tying inside loops
+    if re.search(r'tie=f["\'].*\{.*\}', draft_code):
+        warnings.append("⚠️ Warning: Dynamic string ties (e.g., `tie=f'w_{layer}'`).\n"
+                        "   Note: You usually do not need this. `ax.model` handles loop scoping automatically if written purely.")
+
+    if not warnings:
+        return "✅ Code passes static analysis. No Axiom anti-patterns detected. Proceed to Ghost Pass."
+
+    return "\n\n".join(warnings)
+
+
+@mcp.tool()
+def scan_contract_validator(step_function_code: str, carry_topology: dict, token_topology: dict) -> str:
+    """
+    AI usage: Call this to verify the input/output contract of a custom recurrent `step` function for `.s.scan()`.
+
+    Inputs:
+    - step_function_code: A string defining the `def step(c, t): ...` function.
+    - carry_topology: dict mapping tensor names to axes for the Carry Bundle.
+    - token_topology: dict mapping tensor names to axes for the Token Bundle.
+    """
+    try:
+        compiler_state.reset_pass_state()
+        local_context = {"ax": ax, "nn": nn, "jnp": jnp}
+
+        # Synthesize Carry Bundle
+        carry_tensors = []
+        for var_name, axes_info in carry_topology.items():
+            axes = [getattr(ax, ax_name)(size) for ax_name, size in axes_info]
+            shape = [size for _, size in axes_info]
+            carry_tensors.append(Tensor(jnp.zeros(shape, dtype=jnp.float32), *axes))
+
+        # Synthesize Token Bundle
+        token_tensors = []
+        for var_name, axes_info in token_topology.items():
+            axes = [getattr(ax, ax_name)(size) for ax_name, size in axes_info]
+            shape = [size for _, size in axes_info]
+            token_tensors.append(Tensor(jnp.zeros(shape, dtype=jnp.float32), *axes))
+
+        from axiom.core import Bundle
+        c_bundle = Bundle(carry_tensors) if len(carry_tensors) > 1 else carry_tensors[0]
+        t_bundle = Bundle(token_tensors) if len(token_tensors) > 1 else token_tensors[0]
+
+        # Evaluate the step function
+        exec(step_function_code, {"__builtins__": {}}, local_context)
+        if "step" not in local_context:
+            return "❌ Failed: Could not find a function named `step` in the provided code."
+
+        step_fn = local_context["step"]
+
+        # Execute the contract
+        result = step_fn(c_bundle, t_bundle)
+
+        # Validate the specific Axiom Scan contract
+        if not isinstance(result, tuple) or len(result) != 2:
+            return f"❌ Contract Violation: `step` must return a tuple of length 2: (next_carry, (outputs,)). Got: {type(result)}"
+
+        next_carry, outputs = result
+
+        if not (isinstance(next_carry, Tensor) or type(next_carry).__name__ == 'Bundle'):
+            return f"❌ Contract Violation: `next_carry` (first element) must be a Tensor or Bundle. Got: {type(next_carry)}"
+
+        if not isinstance(outputs, tuple):
+            return f"❌ Contract Violation: `outputs` (second element) must be a tuple of Tensors. Got: {type(outputs)}"
+
+        report = "✅ Scan Contract Verified!\n\n"
+
+        carry_type = "Bundle" if type(next_carry).__name__ == 'Bundle' else "Tensor"
+        carry_tops = [t.topology for t in next_carry.tensors] if carry_type == "Bundle" else [next_carry.topology]
+        report += f"📥 Carry Output ({carry_type}):\n" + "\n".join(f" - {tops}" for tops in carry_tops) + "\n\n"
+
+        report += f"📤 Sequence Outputs ({len(outputs)} tensors):\n" + "\n".join(
+            f" - {t.topology if hasattr(t, 'topology') else 'Unknown'}" for t in outputs)
+
+        return report
+
+    except Exception as e:
+        return f"Scan Contract Validation Failed:\n{traceback.format_exc()}"
 
 
 @mcp.tool()
