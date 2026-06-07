@@ -21,8 +21,16 @@ class AxiomStateManager:
 
         param = compiler_state.params[true_name]
 
-        if hasattr(param, 'shape') and param.shape != shape:
-            raise ValueError(f"Shape mismatch for tied weight '{true_name}'. Expected {shape}, got {param.shape}.")
+        if hasattr(param, 'shape'):
+            if param.shape == shape:
+                pass  # Exact match, return normally
+            elif param.shape == shape[::-1]:
+                # Transpose match! (e.g., tying a (1024, 128) embed to a (128, 1024) proj)
+                param = param.T
+            else:
+                raise ValueError(
+                    f"Shape mismatch for tied weight '{true_name}'. Expected {shape} or its transpose {shape[::-1]}, got {param.shape}.")
+
         return param
 
 
