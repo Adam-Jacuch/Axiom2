@@ -2,6 +2,7 @@ import jax
 from jax.tree_util import register_pytree_node
 from functools import wraps
 from typing import Callable, Any, TypeVar, Optional, Tuple, Dict
+import numpy as np
 
 from .core import compiler_state, decay_monads
 
@@ -18,19 +19,14 @@ class AxiomModel:
     """A mathematically pure PyTree wrapper for Axiom functions."""
 
     def __init__(self, fn: Callable, params: Optional[Dict] = None):
-        # Static Auxiliary Data (The execution logic)
         self.fn = fn
         self.is_initialized = params is not None
-
-        # Dynamic PyTree Leaves (The hardware memory)
         self.params = params if params is not None else {}
 
     def __call__(self, *args, **kwargs):
-        # Decay monads to pure Tensors before crossing the execution boundary
         args = decay_monads(args)
         kwargs = decay_monads(kwargs)
 
-        # --- THE CONTEXT SWITCH ---
         # 1. Snapshot the current trace state
         prev_params = getattr(compiler_state, 'params', {})
         prev_counter = getattr(compiler_state, 'param_counter', 0)
@@ -48,21 +44,15 @@ class AxiomModel:
         is_global_init = getattr(compiler_state, 'is_initializing', False)
 
         if is_global_init or is_uninitialized:
-            # --- THE GHOST PASS ---
             compiler_state.is_initializing = True
             res = self.fn(*args, **kwargs)
-
-            # Save the newly allocated parameters back into the PyTree
             self.params = compiler_state.params.copy()
             self.is_initialized = True
-
-            # Restore global init state
             compiler_state.is_initializing = is_global_init
         else:
-            # --- PURE XLA EXECUTION ---
             res = self.fn(*args, **kwargs)
 
-        # --- RESTORE CONTEXT ---
+        # 4. Restore Context
         compiler_state.param_counter = prev_counter
         compiler_state.active_frames = prev_frames
         compiler_state.func_calls = prev_calls
@@ -71,10 +61,6 @@ class AxiomModel:
         return res
 
     def init(self, *topology: 'Axis', **kwargs) -> 'AxiomModel':
-        """
-        Eagerly initializes the model by running an automatic Ghost Pass.
-        Takes the input topology axes and any required kwargs for the forward pass.
-        """
         import jax.numpy as jnp
         from .core import Tensor
 
@@ -84,21 +70,15 @@ class AxiomModel:
 
         shape = tuple(a.size for a in topology)
         dummy_input = Tensor(jnp.zeros(shape, dtype=jnp.int32), *topology)
-
-        # Pass kwargs into the Ghost Pass
         _ = self(dummy_input, **kwargs)
 
         return self
 
     def astype(self, dtype) -> 'AxiomModel':
-        """
-        Globally casts all parameters in the model to a new precision.
-        """
         import jax
         self.params = jax.tree.map(lambda p: p.astype(dtype), self.params)
         return self
 
-    # --- NATIVE MODEL CALCULUS (For Meta-Learning & RL) ---
     def __sub__(self, other):
         if isinstance(other, dict):
             new_params = jax.tree_util.tree_map(lambda p, g: p - g, self.params, other)
@@ -106,75 +86,48 @@ class AxiomModel:
         raise TypeError("Can only subtract parameter dictionaries from an AxiomModel.")
 
     def __add__(self, other):
-        # Allow adding two Neural Networks together!
         if isinstance(other, AxiomModel):
             new_params = jax.tree_util.tree_map(lambda p1, p2: p1 + p2, self.params, other.params)
             return AxiomModel(self.fn, new_params)
-        # Allow adding gradient dictionaries
         if isinstance(other, dict):
             new_params = jax.tree_util.tree_map(lambda p, g: p + g, self.params, other)
             return AxiomModel(self.fn, new_params)
         raise TypeError("Can only add parameter dicts or AxiomModels to an AxiomModel.")
 
     def __mul__(self, scalar: float):
-        # Allow multiplying an entire Neural Network by a scalar!
         if isinstance(scalar, (int, float)):
             new_params = jax.tree_util.tree_map(lambda p: p * scalar, self.params)
             return AxiomModel(self.fn, new_params)
         raise TypeError("Can only multiply an AxiomModel by a scalar float/int.")
 
-    # --- DICTIONARY DUCK-TYPING (For ergonomic gradient routing) ---
-    def items(self):
-        return self.params.items()
-
-    def keys(self):
-        return self.params.keys()
-
-    def values(self):
-        return self.params.values()
-
-    def __getitem__(self, key: str):
-        return self.params[key]
-
-    def __setitem__(self, key: str, value: Any):
-        self.params[key] = value
-
-    def __contains__(self, key: str):
-        return key in self.params
-
-    def __iter__(self):
-        return iter(self.params)
-
-    def __len__(self):
-        return len(self.params)
+    def items(self): return self.params.items()
+    def keys(self): return self.params.keys()
+    def values(self): return self.params.values()
+    def __getitem__(self, key: str): return self.params[key]
+    def __setitem__(self, key: str, value: Any): self.params[key] = value
+    def __contains__(self, key: str): return key in self.params
+    def __iter__(self): return iter(self.params)
+    def __len__(self): return len(self.params)
 
 
-# Tell JAX how to flatten and unflatten our model!
 def _unflatten_model(aux, children):
-    fn = aux[0]  # ONLY the function is static aux data now!
+    fn = aux[0]
     params = children[0]
-
     model = AxiomModel(fn, params)
-    # If JAX is unflattening this, it means we are inside the trace or execution.
-    # Therefore, the Ghost Pass has already guaranteed initialization!
     model.is_initialized = True
     return model
 
-
 register_pytree_node(
     AxiomModel,
-    lambda m: ((m.params,), (m.fn,)),  # Flatten: Removed m.is_initialized!
-    _unflatten_model  # Unflatten
+    lambda m: ((m.params,), (m.fn,)),
+    _unflatten_model
 )
 
 
 # ==========================================
-# 2. GHOST INITIALIZATION WRAPPERS
+# 2. GHOST PASS & SHARDING WRAPPERS
 # ==========================================
 def _trigger_ghost_pass(fn, *args, **kwargs):
-    """Eagerly runs the function to auto-initialize any uninitialized AxiomModels."""
-
-    # Custom recursive walker to find AxiomModels WITHOUT flattening them into leaves!
     def _get_models(obj):
         models = []
         if isinstance(obj, AxiomModel):
@@ -197,19 +150,67 @@ def _trigger_ghost_pass(fn, *args, **kwargs):
 
 
 class AxiomJitWrapper:
-    def __init__(self, fn, static_argnames=None):
+    def __init__(self, fn, static_argnames=None, shard=None):
         self.fn = fn
         self.static_argnames = static_argnames
+        self.shard = shard
         self._jitted_fn = None
+        self._mesh = None
 
     def __call__(self, *args, **kwargs):
-        # 1. Trigger the Ghost Pass if any model is uninitialized
+        # 1. Trigger the Ghost Pass if uninitialized
         _trigger_ghost_pass(self.fn, *args, **kwargs)
 
-        # 2. Compile and execute the pure JAX function
+        # 2. Lazy Compilation with Sharding Bridge
         if self._jitted_fn is None:
-            # Pass static_argnames down to JAX
-            self._jitted_fn = jax.jit(self.fn, static_argnames=self.static_argnames)
+            if self.shard:
+                from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+                devices = jax.devices()
+                num_axes = len(self.shard)
+
+                # Robust Dynamic Mesh Generation
+                if num_axes == 1:
+                    mesh_devices = np.array(devices)
+                elif num_axes == 2:
+                    # Find a safe 2D geometric grid (e.g., 8 devices -> 2x4)
+                    x = int(np.sqrt(len(devices)))
+                    while len(devices) % x != 0:
+                        x -= 1
+                    mesh_devices = np.array(devices).reshape((x, len(devices) // x))
+                else:
+                    raise ValueError(f"Axiom currently supports up to 2D sharding. Got {num_axes} axes.")
+
+                mesh_names = tuple(f"mesh_{i}" for i in range(num_axes))
+                self._mesh = Mesh(mesh_devices, axis_names=mesh_names)
+
+                # Axiom Axis to Hardware Mesh mapping
+                shard_map = {getattr(a, 'name', str(a)): m_name for a, m_name in zip(self.shard, mesh_names)}
+
+                def get_sharding(obj):
+                    if hasattr(obj, 'topology'):
+                        # Build the exact PartitionSpec based on the Axiom Tensor's topology
+                        spec = PartitionSpec(*[shard_map.get(getattr(a, 'name', str(a)), None) for a in obj.topology])
+                        return NamedSharding(self._mesh, spec)
+                    # For raw arrays (like optax states), return None to let JAX GSPMD auto-shard them!
+                    return None
+
+                # Generate the in_shardings PyTree recursively
+                in_shardings = jax.tree_util.tree_map(get_sharding, args, is_leaf=lambda x: hasattr(x, 'topology'))
+
+                # Wrap the function to ensure XLA recognizes the physical hardware context
+                def mesh_wrapped_fn(*f_args, **f_kwargs):
+                    with self._mesh:
+                        return self.fn(*f_args, **f_kwargs)
+
+                self._jitted_fn = jax.jit(
+                    mesh_wrapped_fn,
+                    static_argnames=self.static_argnames,
+                    in_shardings=in_shardings,
+                    out_shardings=None # Auto-infer output routing optimally
+                )
+            else:
+                self._jitted_fn = jax.jit(self.fn, static_argnames=self.static_argnames)
 
         return self._jitted_fn(*args, **kwargs)
 
@@ -224,14 +225,9 @@ class AxiomGradWrapper:
         import jax.numpy as jnp
         import jax
 
-        # --- 1. THE GHOST PASS BYPASS ---
-        # If we are eagerly initializing, DO NOT let JAX trace!
         if getattr(compiler_state, 'is_initializing', False):
             out = self.fn(*args, **kwargs)
-
-            # Create a mock PyTree of zero-gradients so `apply_updates`
-            # doesn't crash during the rest of the eager step!
-            m = args[0]  # The model being differentiated
+            m = args[0]
             mock_params = {k: jnp.zeros_like(v.unwrap() if hasattr(v, 'unwrap') else v) for k, v in m.params.items()}
             mock_grads = AxiomModel(m.fn, mock_params)
 
@@ -239,7 +235,6 @@ class AxiomGradWrapper:
                 return out, mock_grads
             return mock_grads
 
-        # --- 2. PURE XLA COMPILATION ---
         def jax_compatible_fn(*f_args, **f_kwargs):
             out = self.fn(*f_args, **f_kwargs)
             if self.has_aux:
@@ -263,25 +258,20 @@ class AxiomGradWrapper:
 # 3. THE PUBLIC API
 # ==========================================
 
-def jit(fn=None, *, static_argnames=None):
-    """Compiles an Axiom training step or mathematical function."""
+def jit(fn=None, *, static_argnames=None, shard=None):
+    """Compiles an Axiom training step or mathematical function, with optional sharding."""
     if fn is None:
-        # Called as @ax.jit(static_argnames=[...])
-        return lambda f: AxiomJitWrapper(f, static_argnames=static_argnames)
-
-    # Called simply as @ax.jit
-    return AxiomJitWrapper(fn, static_argnames=static_argnames)
+        return lambda f: AxiomJitWrapper(f, static_argnames=static_argnames, shard=shard)
+    return AxiomJitWrapper(fn, static_argnames=static_argnames, shard=shard)
 
 
 def value_and_grad(fn=None, has_aux=False):
-    """Returns (loss, gradients). Operates transparently on AxiomModels."""
     if fn is None:
         return lambda f: AxiomGradWrapper(f, has_aux=has_aux, is_value_and_grad=True)
     return AxiomGradWrapper(fn, has_aux=has_aux, is_value_and_grad=True)
 
 
 def grad(fn=None, has_aux=False):
-    """Returns only gradients."""
     if fn is None:
         return lambda f: AxiomGradWrapper(f, has_aux=has_aux, is_value_and_grad=False)
     return AxiomGradWrapper(fn, has_aux=has_aux, is_value_and_grad=False)
@@ -289,76 +279,52 @@ def grad(fn=None, has_aux=False):
 
 def apply_updates(model: AxiomModel, grads: Any, optimizer: Any, opt_state: Any) -> Tuple[AxiomModel, Any]:
     import optax
-
     if isinstance(grads, dict):
         grads = AxiomModel(model.fn, grads)
-
-    if opt_state is None: # not recommended; fallback
+    if opt_state is None:
         opt_state = optimizer.init(model)
-
     updates, new_opt_state = optimizer.update(grads, opt_state, model)
     new_model = optax.apply_updates(model, updates)
     return new_model, new_opt_state
 
 
 def to_jax(model, *init_axes: 'Axis', **kwargs):
-    """
-    Converts an AxiomModel into a pure JAX (params, apply_fn) paradigm.
-    If init_axes are provided, it automatically initializes the model weights.
-    Accepts arbitrary **kwargs (e.g., training=True) for the initialization pass.
-    """
     import inspect
-
-    # If the user passed a raw Python function, quietly wrap it for them!
     if inspect.isfunction(model):
-        from axiom import ax  # Lazy import to prevent circular dependencies
+        from axiom import ax
         model = ax.model(model)
 
-    # Auto-Initialization
     if init_axes and not model.is_initialized:
         import jax.numpy as jnp
         from .core import Tensor, Axis
-
         shape = []
         for a in init_axes:
             if not isinstance(a, Axis) or a.size is None:
                 raise ValueError(f"Auto-initialization requires strictly sized Axes, got: {a}")
             shape.append(a.size)
-
-        # Synthesize a dummy tensor and trigger the Ghost Pass internally!
         dummy_input = Tensor(jnp.zeros(shape), *init_axes)
-
-        # THE FIX: Pass kwargs into the initialization pass!
         _ = model(dummy_input, **kwargs)
 
     if not model.is_initialized:
-        raise ValueError(
-            "AxiomModel must be initialized. Either run an eager forward pass first, "
-            "or pass input axes directly: ax.to_jax(model, ax.b(1), ax.d(32))"
-        )
+        raise ValueError("AxiomModel must be initialized.")
 
-    # The parameters are already a flat dictionary of raw jax.Arrays!
     params = model.params.copy()
 
     def apply_fn(params_dict, *args, **apply_kwargs):
         from .core import decay_monads, compiler_state
-
         args = decay_monads(args)
         apply_kwargs = decay_monads(apply_kwargs)
 
-        # 1. Snapshot the state
         prev_params = getattr(compiler_state, 'params', {})
         prev_counter = getattr(compiler_state, 'param_counter', 0)
         prev_frames = compiler_state.active_frames.copy()
         prev_calls = compiler_state.func_calls.copy()
 
-        # 2. Inject the pure functional parameters
         compiler_state.params = params_dict
         compiler_state.param_counter = 0
         compiler_state.active_frames.clear()
         compiler_state.func_calls.clear()
 
-        # 3. Execute and safely restore
         try:
             res = model.fn(*args, **apply_kwargs)
         finally:
