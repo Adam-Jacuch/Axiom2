@@ -121,8 +121,7 @@ class Axis:
         return self.size + other
 
     def __repr__(self):
-        size_str = f"={self.size}" if self.size is not None else ""
-        return f"Axis('{self.name}'{size_str})"
+        return f"Axis({self.name}={self.size})"
 
     def __hash__(self):
         return hash(self.name)
@@ -1555,14 +1554,42 @@ class Tensor(NNTensorStubs):
         return str(self.unwrap())
 
     def __repr__(self):
-        """Controls what happens when the tensor is inspected in the console"""
-        # Build a nice string of the topology: e.g., (b=4, s=32, d=16)
-        top_str = ", ".join(f"{a.name}={a.size}" for a in self.topology)
+        """
+        Takes over the IDE debugger display to show pure topology and numerical stats.
+        Example: Tensor[b[4], d[128]] || μ: 0.002 | σ²: 1.010 | σ: 1.005
+        """
+        import jax
+        import jax.numpy as jnp
 
-        # Indent the raw JAX array for a clean visual hierarchy
-        raw_repr = repr(self.unwrap()).replace('\n', '\n       ')
+        # 1. Build the topological string
+        topo_strings = []
+        for a in self.topology:
+            size_str = str(a.size) if a.size is not None else "?"
+            name_str = getattr(a, 'name', 'unnamed')
+            topo_strings.append(f"{name_str}[{size_str}]")
 
-        return f"Tensor({raw_repr},\n       topology=({top_str}))"
+        topo_str = ", ".join(topo_strings)
+        base_repr = f"Tensor[{topo_str}]"
+
+        # 2. Extract the raw array
+        raw_val = self.unwrap() if hasattr(self, 'unwrap') else None
+
+        # 3. THE SAFETY SHIELD: Do not calculate math on JAX Tracers!
+        if isinstance(raw_val, jax.core.Tracer):
+            return f"{base_repr} (Traced)"
+
+        # 4. Compute stats for concrete arrays
+        try:
+            # We cast to float to ensure clean string formatting
+            mean_val = float(jnp.mean(raw_val))
+            var_val = float(jnp.var(raw_val))
+            std_val = float(jnp.std(raw_val))
+
+            stats_str = f"μ: {mean_val:.4f} | σ²: {var_val:.4f} | σ: {std_val:.4f}"
+            return f"{base_repr} || {stats_str}"
+        except Exception:
+            # Safe fallback if the array is empty or has an unsupported dtype
+            return base_repr
 
     def __format__(self, format_spec: str) -> str:
         """Safely formats the tensor. Falls back to __str__ if not formatting a scalar."""
