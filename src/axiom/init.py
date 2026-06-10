@@ -93,3 +93,32 @@ def arange(*args) -> Tensor:
     final_ax = target_ax(raw_array.size) if target_ax.size is None else target_ax
 
     return Tensor(raw_array, final_ax)
+
+
+def linspace(start: float, stop: float, target_ax: 'Axis', endpoint: bool = True, dtype=None) -> Tensor:
+    """
+    Axiom wrapper for jnp.linspace.
+    Automatically derives the number of steps directly from the target Axis size.
+
+    Usage:
+        # Generates 128 evenly spaced points between 0.0 and 1.0
+        init.linspace(0.0, 1.0, ax.s(128))
+    """
+    import jax.numpy as jnp
+
+    if not hasattr(target_ax, 'size') or target_ax.size is None:
+        raise ValueError(
+            f"Target axis '{getattr(target_ax, 'name', str(target_ax))}' must have a "
+            "defined size to generate a linspace."
+        )
+
+    # Let the axis dictate the tensor geometry
+    raw_array = jnp.linspace(
+        start,
+        stop,
+        num=target_ax.size,
+        endpoint=endpoint,
+        dtype=dtype
+    )
+
+    return Tensor(raw_array, target_ax)
