@@ -1341,6 +1341,43 @@ class Tensor(NNTensorStubs):
     def topology(self) -> Tuple[Axis, ...]:
         return self._axes
 
+    @property
+    def debugger_stats(self):
+        """
+        Evaluated on-demand by the PyCharm debugger dropdown.
+        Provides safe, beautifully formatted numerical observability.
+        """
+        import jax
+        import jax.numpy as jnp
+        import math
+
+        raw_val = self.unwrap() if hasattr(self, 'unwrap') else None
+
+        if isinstance(raw_val, jax.core.Tracer):
+            return "Currently Traced (No concrete values)"
+
+        try:
+            def fmt(v):
+                v = float(v)
+                if math.isnan(v): return "NaN ⚠️"
+                if math.isinf(v): return "Inf ⚠️"
+                if v == 0: return "0.0000"
+                # Use scientific notation for very small or very large numbers
+                if abs(v) < 1e-4 or abs(v) > 1e4:
+                    return f"{v:.4e}"
+                # Standard 4-decimal format for everything else
+                return f"{v:.4f}"
+
+            return {
+                "mean": fmt(jnp.mean(raw_val)),
+                "var": fmt(jnp.var(raw_val)),
+                "std": fmt(jnp.std(raw_val)),
+                "min": fmt(jnp.min(raw_val)),
+                "max": fmt(jnp.max(raw_val))
+            }
+        except Exception:
+            return "Stats unavailable (Empty or unsupported dtype)"
+
     def param(self, name: Optional[str] = None, tie: Optional[Tie] = None) -> 'Tensor':
         """Registers the tensor as a trainable parameter for the AOT compiler."""
         self._is_param = True
@@ -1555,41 +1592,11 @@ class Tensor(NNTensorStubs):
 
     def __repr__(self):
         """
-        Takes over the IDE debugger display to show pure topology and numerical stats.
-        Example: Tensor[b[4], d[128]] || μ: 0.002 | σ²: 1.010 | σ: 1.005
+        Keeps PyCharm inline hints completely pristine.
+        Example: Tensor[b[4], s[32], d[16]]
         """
-        import jax
-        import jax.numpy as jnp
-
-        # 1. Build the topological string
-        topo_strings = []
-        for a in self.topology:
-            size_str = str(a.size) if a.size is not None else "?"
-            name_str = getattr(a, 'name', 'unnamed')
-            topo_strings.append(f"{name_str}[{size_str}]")
-
-        topo_str = ", ".join(topo_strings)
-        base_repr = f"Tensor[{topo_str}]"
-
-        # 2. Extract the raw array
-        raw_val = self.unwrap() if hasattr(self, 'unwrap') else None
-
-        # 3. THE SAFETY SHIELD: Do not calculate math on JAX Tracers!
-        if isinstance(raw_val, jax.core.Tracer):
-            return f"{base_repr} (Traced)"
-
-        # 4. Compute stats for concrete arrays
-        try:
-            # We cast to float to ensure clean string formatting
-            mean_val = float(jnp.mean(raw_val))
-            var_val = float(jnp.var(raw_val))
-            std_val = float(jnp.std(raw_val))
-
-            stats_str = f"μ: {mean_val:.4f} | σ²: {var_val:.4f} | σ: {std_val:.4f}"
-            return f"{base_repr} || {stats_str}"
-        except Exception:
-            # Safe fallback if the array is empty or has an unsupported dtype
-            return base_repr
+        topo_strings = [f"{getattr(a, 'name', '?')}[{a.size if a.size is not None else '?'}]" for a in self.topology]
+        return f"Tensor[{', '.join(topo_strings)}]"
 
     def __format__(self, format_spec: str) -> str:
         """Safely formats the tensor. Falls back to __str__ if not formatting a scalar."""
