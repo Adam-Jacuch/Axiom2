@@ -1326,6 +1326,16 @@ class Tensor(NNTensorStubs):
         self._validate_topology()
 
     def _validate_topology(self):
+        seen_names = set()
+        for axis in self._axes:
+            if axis.name in seen_names:
+                raise ValueError(
+                    f"Topological Ambiguity: Tensor contains duplicate axis '{axis.name}'.\n"
+                    f"Axiom enforces Strict Identity. If these represent distinct vector spaces, "
+                    f"you must use .rename() to differentiate them (e.g., '{axis.name}_1', '{axis.name}_2')."
+                )
+            seen_names.add(axis.name)
+
         if hasattr(self._tensor, 'shape'):
             if len(self._tensor.shape) != len(self._axes):
                 raise ValueError(
