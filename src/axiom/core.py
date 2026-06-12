@@ -234,6 +234,50 @@ class _AxisNamespace:
         print(f"Loaded {len(params_dict)} parameters from {path}")
         return params_dict
 
+    def trace(self, *topology: 'Axis', dtype=None, max_int=32000, init_fn=None):
+        """
+        Eagerly executes a block with synthesized data to trigger IDE breakpoints.
+
+        Usage:
+            # Default normal distribution
+            @ax.trace(ax.b(4), ax.s(1024), ax.d(128))
+
+            # Custom deterministic override
+            @ax.trace(ax.b(1), ax.s(32), init_fn=init.ones)
+        """
+        import jax.numpy as jnp
+        from . import init
+
+        dtype = dtype or jnp.float32
+
+        def decorator(func):
+            print(f"\n🔬 Axiom Trace: Triggering breakpoints for '{func.__name__}'...")
+
+            # 1. Synthesize data: Custom vs. Heuristic
+            if init_fn is not None:
+                # Use the user's explicit initialization
+                dummy_input = init_fn(*topology).astype(dtype)
+            else:
+                # Fallback to smart heuristics
+                if jnp.issubdtype(jnp.dtype(dtype), jnp.integer):
+                    dummy_input = (init.uniform(*topology) * max_int).astype(dtype)
+                else:
+                    dummy_input = init.normal(*topology).astype(dtype)
+
+            # 2. Execute eagerly through the model wrapper
+            from .compiler import AxiomModel
+            model = AxiomModel(func)
+
+            # 3. Hit the breakpoint natively!
+            out = model(dummy_input)
+
+            topo_str = ", ".join([f"{a.name}[{a.size}]" for a in out.topology])
+            print(f"✅ Trace complete. Output: Tensor[{topo_str}]")
+
+            return func
+
+        return decorator
+
     @property
     def remat(self):
         """Gradient checkpointing (Transparent during Ghost Pass to prevent Tracer leaks)."""

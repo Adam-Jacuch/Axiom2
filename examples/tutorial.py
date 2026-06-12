@@ -24,6 +24,9 @@ def g(x: Tensor) -> Tensor:
     # for functions that allocate params, you can override their default inits via init=
     return x.d2.silu().d2.proj(ax.d(x.d2 // 2), init=init.normal * 0.01)
 
+# for breakpoint debugging, you can use ax.trace to walk a dummy tensor through the model
+# axiom naturally supports a robust debugger experience, walking you through how the tensor topology mutates
+@ax.trace(ax.b(4), ax.s(32), ax.d(16))
 def f(x: Tensor) -> Tensor:
     # function composition. new parameters are allocated for each call.
     return g(g(g(x)))
