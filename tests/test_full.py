@@ -1576,3 +1576,46 @@ def test_jit_static_argnames():
     assert jnp.allclose(out_eval.unwrap(), 0.5), "Static arg 'False' branch failed to compile correctly!"
 
     print("Static compilation passed!")
+
+
+def test_tensor_broadcast():
+    import jax.numpy as jnp
+    # (Assuming ax and Tensor are imported from axiom)
+
+    # --- 1. Base Setup ---
+    # Create a simple 1D batched vector: Tensor[b[4]]
+    base_raw = jnp.array([1.0, 2.0, 3.0, 4.0])
+    x = Tensor(base_raw, ax.b(4))
+
+    # --- 2. Valid Geometric Expansion ---
+    # Project into sequence and hidden dimensions
+    expanded = x.broadcast(ax.s(8), ax.d(16))
+
+    # Verify exact topological lineage
+    assert len(expanded.topology) == 3
+    assert expanded.topology[0].name == 'b'
+    assert expanded.topology[1].name == 's'
+    assert expanded.topology[2].name == 'd'
+
+    # Verify physical memory shape (4, 8, 16)
+    assert expanded.unwrap().shape == (4, 8, 16)
+
+    # Verify the actual broadcast values (all sequence/hidden slots
+    # for batch 0 should contain '1.0', batch 1 contains '2.0', etc.)
+    assert float(expanded.unwrap()[1, 5, 10]) == 2.0
+
+    # --- 3. The Strict Identity Shield ---
+    try:
+        x.broadcast(ax.b(8))
+        assert False, "Shield Failed: Allowed broadcasting to an existing axis."
+    except ValueError as e:
+        assert "already exists in the current topology" in str(e)
+
+    # --- 4. The Unknown Geometry Shield ---
+    try:
+        x.broadcast(ax.this_is_a_fresh_axis)
+        assert False, "Shield Failed: Allowed broadcasting to an unsized axis."
+    except ValueError as e:
+        assert "must have a strictly defined size" in str(e)
+
+    print("✅ Tensor.broadcast() passed all geometric and safety checks.")

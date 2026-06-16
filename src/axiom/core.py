@@ -1477,6 +1477,42 @@ class Tensor(NNTensorStubs):
         import jax.numpy as jnp
         return Tensor(jnp.sum(self.unwrap()))
 
+    def broadcast(self, *new_axes: 'Axis') -> 'Tensor':
+        """
+        Projects the tensor into new geometric dimensions without allocating dummy variables.
+        """
+        import jax.numpy as jnp
+
+        # 1. The Hardened Geometric Shield
+        current_names = {a.name for a in self.topology}
+        for a in new_axes:
+            if a.name in current_names:
+                raise ValueError(
+                    f"Topological Ambiguity: Cannot broadcast to '{a.name}'. "
+                    f"Axis already exists in the current topology."
+                )
+
+            # THE FIX: Explicit integer and bounds checking
+            if not isinstance(getattr(a, 'size', None), int) or a.size <= 0:
+                raise ValueError(
+                    f"Unknown Geometry: Broadcast target axis '{getattr(a, 'name', '?')}' "
+                    "must have a strictly defined size."
+                )
+
+        # 2. Expand the physical dimensions
+        raw_val = self.unwrap()
+        for _ in new_axes:
+            raw_val = jnp.expand_dims(raw_val, axis=-1)
+
+        # 3. Calculate the target geometry
+        final_topology = tuple(self.topology) + new_axes
+        target_shape = tuple(a.size for a in final_topology)
+
+        # 4. Zero-Cost XLA Broadcast
+        broadcasted_raw = jnp.broadcast_to(raw_val, target_shape)
+
+        return Tensor(broadcasted_raw, *final_topology)
+
     def repeat(self, func: callable, times: int) -> 'Tensor':
         """Executes a function multiple times using the exact same tied parameters."""
         import jax.lax as lax
