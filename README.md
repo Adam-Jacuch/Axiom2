@@ -13,22 +13,22 @@ Kill the boilerplate. Name your axes.
 Axiom requires Python 3.10+ and relies heavily on JAX and Optax. Since Axiom is currently in active development, install it directly from GitHub:
 
 ```bash
-pip install git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)
+pip install git+https://github.com/Adam-Jacuch/Axiom2.git
 ```
 
 **Hardware Acceleration:**
 Install the version tailored to your hardware using the optional dependency flags. When installing directly from GitHub, use the following syntax:
 
 ```bash
-pip install "axiom-jax[cuda13] @ git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)"  # For NVIDIA GPUs (CUDA 13)
-pip install "axiom-jax[cuda12] @ git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)"  # For NVIDIA GPUs (CUDA 12)
-pip install "axiom-jax[apple] @ git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)"   # For Apple Silicon (Metal)
-pip install "axiom-jax[tpu] @ git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)"     # For Google TPUs
+pip install "axiom-jax[cuda13] @ git+https://github.com/Adam-Jacuch/Axiom2.git"  # For NVIDIA GPUs (CUDA 13)
+pip install "axiom-jax[cuda12] @ git+https://github.com/Adam-Jacuch/Axiom2.git"  # For NVIDIA GPUs (CUDA 12)
+pip install "axiom-jax[apple] @ git+https://github.com/Adam-Jacuch/Axiom2.git"   # For Apple Silicon (Metal)
+pip install "axiom-jax[tpu] @ git+https://github.com/Adam-Jacuch/Axiom2.git"     # For Google TPUs
 ```
 
 Alternatively, you can clone the repository and install it locally (recommended for active development):
 ```bash
-git clone [https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)
+git clone https://github.com/Adam-Jacuch/Axiom2.git
 cd Axiom2
 pip install -e ".[cuda13]"  # Replace cuda13 with your target hardware
 ```
@@ -144,7 +144,7 @@ Axiom includes a native **Model Context Protocol (MCP)** server. Instead of figh
 
 When installing from GitHub:
 ```bash
-pip install "axiom-jax[cuda13,ai] @ git+[https://github.com/Adam-Jacuch/Axiom2.git](https://github.com/Adam-Jacuch/Axiom2.git)"
+pip install "axiom-jax[cuda13,ai] @ git+https://github.com/Adam-Jacuch/Axiom2.git"
 ```
 
 When activated, your AI assistant (Claude, GPT, Gemini) gains the ability to:
