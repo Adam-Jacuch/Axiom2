@@ -8,13 +8,27 @@ import jax.nn as jnn
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Type
 
 if TYPE_CHECKING:
-    from ._nn_stubs import NNTensorStubs, NNTargetedTensorStubs, NNTargetedBundleStubs
+    from ._nn_stubs import (
+        AxisNamespaceStubs,
+        NNBundleStubs,
+        NNTensorStubs,
+        NNTargetedBundleStubs,
+        NNTargetedTensorStubs,
+    )
 else:
+    class AxisNamespaceStubs:
+        pass
+
+
     class NNTensorStubs:
         pass
 
 
     class NNTargetedTensorStubs:
+        pass
+
+
+    class NNBundleStubs:
         pass
 
 
@@ -130,7 +144,7 @@ class Axis:
         return isinstance(other, Axis) and self.name == other.name
 
 
-class _AxisNamespace:
+class _AxisNamespace(AxisNamespaceStubs):
     def __call__(self, name: str, size: Optional[int] = None) -> Axis:
         return Axis(name, size)
 
@@ -592,10 +606,12 @@ class TargetedTensor(NNTargetedTensorStubs):
 
         raise AttributeError(f"Targeted axis, NN function, or JAX primitive '{name}' not found.")
 
-    def pw(self, func, tie: Optional[str] = None, **kwargs) -> 'Tensor':
+    def pw(self, func, *args, tie: Optional[str] = None, **kwargs) -> 'Tensor':
         """Executes a function while preserving topology and intelligently injecting the 'axis' parameter."""
         if getattr(func, '_is_axiom_nn', False):
-            return func(self, tie=tie, **kwargs)
+            if tie is None:
+                return func(self, *args, **kwargs)
+            return func(self, *args, tie=tie, **kwargs)
 
         try:
             sig = inspect.signature(func)
@@ -605,7 +621,7 @@ class TargetedTensor(NNTargetedTensorStubs):
         except ValueError:
             pass
 
-        raw_result = func(self.tensor.unwrap(), **kwargs)
+        raw_result = func(self.tensor.unwrap(), *args, **kwargs)
 
         # --- Auto-detect Dimensionality Reduction ---
         if hasattr(raw_result, 'shape') and len(raw_result.shape) < len(self.tensor.topology):
@@ -1057,8 +1073,15 @@ class TargetedBundle(NNTargetedBundleStubs):
     def gate(self, init=None, tie: Optional[str] = None) -> 'Bundle':
         return Bundle(*[TargetedTensor(t, self.target_axes).gate(init=init, tie=tie) for t in self.bundle.tensors])
 
-    def pw(self, func, tie: Optional[str] = None, **kwargs) -> 'Bundle':
-        return Bundle(*[TargetedTensor(t, self.target_axes).pw(func, tie=tie, **kwargs) for t in self.bundle.tensors])
+    def pw(self, func, *args, tie: Optional[str] = None, **kwargs) -> 'Bundle':
+        return Bundle(
+            *[
+                TargetedTensor(t, self.target_axes).pw(
+                    func, *args, tie=tie, **kwargs
+                )
+                for t in self.bundle.tensors
+            ]
+        )
 
     def merge(self, new_axis: Axis) -> 'Bundle':
         """
@@ -1234,7 +1257,7 @@ class TargetedBundle(NNTargetedBundleStubs):
             yield self[i]
 
 
-class Bundle:
+class Bundle(NNBundleStubs):
     """Wraps multiple Tensors to perform parallel, fused operations."""
 
     def __init__(self, *tensors: Tensor):
