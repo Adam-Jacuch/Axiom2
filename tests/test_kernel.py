@@ -88,32 +88,28 @@ def test_causal_flash_attention_uses_map_and_fold_grid_coordinates():
 
     def causal_flash_tile(inputs):
         q_tile, k_full, v_full = inputs
-        q_values = q_tile.unwrap()
-        q_positions = ax.grid[ax.s] * 4 + ax.tile[ax.s]
-        init = (
-            jnp.full(q_values.shape[:-1], -jnp.inf, dtype=q_values.dtype),
-            jnp.zeros(q_values.shape[:-1], dtype=q_values.dtype),
-            jnp.zeros_like(q_values),
-        )
+        q_tile = q_tile.astype(jnp.float32)
+        zeros = q_tile.d.sum() * 0.0
+        init = (zeros - jnp.inf, zeros, q_tile * 0.0)
 
         def causal_online_step(carry, kv_tile):
             max_so_far, normalizer, accumulator = carry
             k_tile, v_tile = kv_tile
-            k_positions = ax.grid[ax.sk] * 4 + ax.tile[ax.sk]
-            scores = jnp.einsum("bhqd,bhkd->bhqk", q_values, k_tile.unwrap()) / jnp.sqrt(d.size)
-            scores = jnp.where(
-                k_positions[None, None, None, :] <= q_positions[None, None, :, None],
-                scores,
-                -jnp.inf,
+            scores = (q_tile @ k_tile.astype(jnp.float32)) / jnp.sqrt(d.size)
+            scores = scores.s.sk.mask(
+                lambda q_local, k_local: (
+                    ax.grid[ax.sk] * 4 + k_local
+                    > ax.grid[ax.s] * 4 + q_local
+                ),
+                fill=-jnp.inf,
             )
-            next_max = jnp.maximum(max_so_far, jnp.max(scores, axis=-1))
-            previous_weight = jnp.exp(max_so_far - next_max)
-            weights = jnp.exp(scores - next_max[..., None])
+            next_max = max_so_far.maximum(scores.sk.max())
+            previous_weight = (max_so_far - next_max).exp()
+            weights = (scores - next_max).exp()
             return (
                 next_max,
-                previous_weight * normalizer + jnp.sum(weights, axis=-1),
-                previous_weight[..., None] * accumulator
-                + jnp.einsum("bhqk,bhkd->bhqd", weights, v_tile.unwrap()),
+                previous_weight * normalizer + weights.sk.sum(),
+                previous_weight * accumulator + (weights @ v_tile.astype(jnp.float32)),
             )
 
         _, normalizer, accumulator = (k_full & v_full).sk(4).fold(
@@ -122,7 +118,7 @@ def test_causal_flash_attention_uses_map_and_fold_grid_coordinates():
             until=ax.grid[ax.s] + 1,
             stages=2,
         )
-        return Tensor(accumulator / normalizer[..., None], *q_tile.topology)
+        return accumulator / normalizer
 
     actual = (query & key & value).b(1).h(1).s(4).map(causal_flash_tile)
     scores = jnp.einsum("bhqd,bhkd->bhqk", q_raw, k_raw) / jnp.sqrt(d.size)

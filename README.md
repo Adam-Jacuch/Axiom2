@@ -107,7 +107,7 @@ Axiom can lower tiled named-axis programs to `jax.experimental.pallas.pallas_cal
 
 ```python
 out = (left & right).m(128).n(128).map(
-    lambda pair: Tensor(pair[0].unwrap() @ pair[1].unwrap(), ax.m(128), ax.n(128))
+    lambda pair: pair[0] @ pair[1]     # contracts the shared k axis
 )
 ```
 
@@ -119,29 +119,33 @@ from axiom import ax, Tensor
 
 def causal_flash_tile(qkv):
     q, k, v = qkv                      # q: [b, h, s, d], k/v: [b, h, sk, d]
-    q_values = q.unwrap().astype(jnp.float32)
-    q_pos = ax.grid[ax.s] * 64 + ax.tile[ax.s]
+    q = q.astype(jnp.float32)           # accumulate in FP32 registers
+    zeros = q.d.sum() * 0.0
     init = (
-        jnp.full(q_values.shape[:-1], -jnp.inf),  # online-softmax max
-        jnp.zeros(q_values.shape[:-1]),           # online-softmax normalizer
-        jnp.zeros_like(q_values),                 # value accumulator
+        zeros - jnp.inf,                   # online-softmax max: [b, h, s]
+        zeros,                              # online-softmax normalizer: [b, h, s]
+        q * 0.0,                            # value accumulator: [b, h, s, d]
     )
 
     def attend_key_tile(carry, kv):
         max_so_far, normalizer, accumulator = carry
         k_tile, v_tile = kv
-        k_pos = ax.grid[ax.sk] * 64 + ax.tile[ax.sk]
-        scores = jnp.einsum("bhqd,bhkd->bhqk", q_values, k_tile.unwrap().astype(jnp.float32)) / jnp.sqrt(q.d.size)
-        scores = jnp.where(k_pos[None, None, None, :] <= q_pos[None, None, :, None], scores, -jnp.inf)
+        scores = (q @ k_tile.astype(jnp.float32)) / jnp.sqrt(q.d.size)
+        scores = scores.s.sk.mask(
+            lambda q_local, k_local: (
+                ax.grid[ax.sk] * 64 + k_local
+                > ax.grid[ax.s] * 64 + q_local
+            ),
+            fill=-jnp.inf,
+        )
 
-        next_max = jnp.maximum(max_so_far, jnp.max(scores, axis=-1))
-        previous_weight = jnp.exp(max_so_far - next_max)
-        weights = jnp.exp(scores - next_max[..., None])
+        next_max = max_so_far.maximum(scores.sk.max())
+        previous_weight = (max_so_far - next_max).exp()
+        weights = (scores - next_max).exp()
         return (
             next_max,
-            previous_weight * normalizer + jnp.sum(weights, axis=-1),
-            previous_weight[..., None] * accumulator
-            + jnp.einsum("bhqk,bhkd->bhqd", weights, v_tile.unwrap().astype(jnp.float32)),
+            previous_weight * normalizer + weights.sk.sum(),
+            previous_weight * accumulator + (weights @ v_tile.astype(jnp.float32)),
         )
 
     _, normalizer, accumulator = (k & v).sk(64).fold(
@@ -150,7 +154,7 @@ def causal_flash_tile(qkv):
         until=ax.grid[ax.s] + 1,
         stages=2,
     )
-    return Tensor((accumulator / normalizer[..., None]).astype(q.unwrap().dtype), *q.topology)
+    return accumulator / normalizer
 
 # One parallel program per [batch, head, query-block].
 out = (q & k & v).b(1).h(1).s(64).map(causal_flash_tile)
