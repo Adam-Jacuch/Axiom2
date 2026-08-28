@@ -101,6 +101,65 @@ def mutate_prefix(x: Tensor) -> Tensor:
 
 ---
 
+## ⚙️ Named-Axis Pallas Kernels
+
+Axiom can lower tiled named-axis programs to `jax.experimental.pallas.pallas_call` without exposing positional `BlockSpec` boilerplate. Tile the axes that own the parallel output, then use `.map()` to define one Pallas program. Bundles remain bundles inside the kernel body.
+
+```python
+out = (left & right).m(128).n(128).map(
+    lambda pair: Tensor(pair[0].unwrap() @ pair[1].unwrap(), ax.m(128), ax.n(128))
+)
+```
+
+Inside a map, `ax.grid[axis]` is the named program coordinate and `ax.tile[axis]` is the tile-local register index vector. `.fold()` performs a sequential, register-resident loop inside the program; the fold coordinate is also available through `ax.grid`.
+
+```python
+import jax.numpy as jnp
+from axiom import ax, Tensor
+
+def causal_flash_tile(qkv):
+    q, k, v = qkv                      # q: [b, h, s, d], k/v: [b, h, sk, d]
+    q_values = q.unwrap().astype(jnp.float32)
+    q_pos = ax.grid[ax.s] * 64 + ax.tile[ax.s]
+    init = (
+        jnp.full(q_values.shape[:-1], -jnp.inf),  # online-softmax max
+        jnp.zeros(q_values.shape[:-1]),           # online-softmax normalizer
+        jnp.zeros_like(q_values),                 # value accumulator
+    )
+
+    def attend_key_tile(carry, kv):
+        max_so_far, normalizer, accumulator = carry
+        k_tile, v_tile = kv
+        k_pos = ax.grid[ax.sk] * 64 + ax.tile[ax.sk]
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q_values, k_tile.unwrap().astype(jnp.float32)) / jnp.sqrt(q.d.size)
+        scores = jnp.where(k_pos[None, None, None, :] <= q_pos[None, None, :, None], scores, -jnp.inf)
+
+        next_max = jnp.maximum(max_so_far, jnp.max(scores, axis=-1))
+        previous_weight = jnp.exp(max_so_far - next_max)
+        weights = jnp.exp(scores - next_max[..., None])
+        return (
+            next_max,
+            previous_weight * normalizer + jnp.sum(weights, axis=-1),
+            previous_weight[..., None] * accumulator
+            + jnp.einsum("bhqk,bhkd->bhqd", weights, v_tile.unwrap().astype(jnp.float32)),
+        )
+
+    _, normalizer, accumulator = (k & v).sk(64).fold(
+        attend_key_tile,
+        init=init,
+        until=ax.grid[ax.s] + 1,
+        stages=2,
+    )
+    return Tensor((accumulator / normalizer[..., None]).astype(q.unwrap().dtype), *q.topology)
+
+# One parallel program per [batch, head, query-block].
+out = (q & k & v).b(1).h(1).s(64).map(causal_flash_tile)
+```
+
+Tail tiles are supported: the last program receives a fixed-size block with deterministic zero padding, and out-of-bounds stores are discarded. CPU runs automatically use Pallas interpret mode; GPU/TPU runs use native lowering. `stages` is a portable pipeline hint, with backend-specific asynchronous buffering controlled by the active Pallas backend.
+
+---
+
 ## 🚀 60-Second Training Loop
 
 Axiom models are pure functions, but we provide lightweight wrappers to integrate seamlessly with standard JAX transformations and Optax optimizers.

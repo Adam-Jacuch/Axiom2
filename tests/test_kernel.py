@@ -79,6 +79,63 @@ def test_fused_flash_attention_fold_matches_eager_attention():
     assert jnp.allclose(actual.unwrap(), expected, atol=1e-5, rtol=1e-5)
 
 
+def test_causal_flash_attention_uses_map_and_fold_grid_coordinates():
+    b, h, s, sk, d = ax.b(1), ax.h(1), ax.s(8), ax.sk(8), ax.d(4)
+    q_raw, k_raw, v_raw = jax.random.normal(jax.random.key(3), (3, b.size, h.size, s.size, d.size))
+    query = wrap(q_raw, b, h, s, d)
+    key = wrap(k_raw, b, h, sk, d)
+    value = wrap(v_raw, b, h, sk, d)
+
+    def causal_flash_tile(inputs):
+        q_tile, k_full, v_full = inputs
+        q_values = q_tile.unwrap()
+        q_positions = ax.grid[ax.s] * 4 + ax.tile[ax.s]
+        init = (
+            jnp.full(q_values.shape[:-1], -jnp.inf, dtype=q_values.dtype),
+            jnp.zeros(q_values.shape[:-1], dtype=q_values.dtype),
+            jnp.zeros_like(q_values),
+        )
+
+        def causal_online_step(carry, kv_tile):
+            max_so_far, normalizer, accumulator = carry
+            k_tile, v_tile = kv_tile
+            k_positions = ax.grid[ax.sk] * 4 + ax.tile[ax.sk]
+            scores = jnp.einsum("bhqd,bhkd->bhqk", q_values, k_tile.unwrap()) / jnp.sqrt(d.size)
+            scores = jnp.where(
+                k_positions[None, None, None, :] <= q_positions[None, None, :, None],
+                scores,
+                -jnp.inf,
+            )
+            next_max = jnp.maximum(max_so_far, jnp.max(scores, axis=-1))
+            previous_weight = jnp.exp(max_so_far - next_max)
+            weights = jnp.exp(scores - next_max[..., None])
+            return (
+                next_max,
+                previous_weight * normalizer + jnp.sum(weights, axis=-1),
+                previous_weight[..., None] * accumulator
+                + jnp.einsum("bhqk,bhkd->bhqd", weights, v_tile.unwrap()),
+            )
+
+        _, normalizer, accumulator = (k_full & v_full).sk(4).fold(
+            causal_online_step,
+            init=init,
+            until=ax.grid[ax.s] + 1,
+            stages=2,
+        )
+        return Tensor(accumulator / normalizer[..., None], *q_tile.topology)
+
+    actual = (query & key & value).b(1).h(1).s(4).map(causal_flash_tile)
+    scores = jnp.einsum("bhqd,bhkd->bhqk", q_raw, k_raw) / jnp.sqrt(d.size)
+    causal_mask = jnp.arange(sk.size)[None, :] <= jnp.arange(s.size)[:, None]
+    expected = jnp.einsum(
+        "bhqk,bhkd->bhqd",
+        jax.nn.softmax(jnp.where(causal_mask[None, None], scores, -jnp.inf), axis=-1),
+        v_raw,
+    )
+
+    assert jnp.allclose(actual.unwrap(), expected, atol=1e-5, rtol=1e-5)
+
+
 def test_fold_accepts_dynamic_until_and_stages():
     x = wrap(jnp.arange(8, dtype=jnp.float32).reshape(2, 4), ax.b(2), ax.s(4))
 

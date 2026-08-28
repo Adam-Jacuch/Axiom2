@@ -415,7 +415,19 @@ class TiledAxisRef:
                 topology[axis_position] = Axis(axis_name, tile_size)
                 local_tensors.append(Tensor(raw, *topology))
             step_input = _rebuild_source(self._source, local_tensors)
-            return step_fn(carry, step_input)
+            parent_context = _KERNEL_CONTEXT.get()
+            if parent_context is None:
+                return step_fn(carry, step_input)
+
+            # A fold is a sequential grid nested inside the surrounding map.
+            # Making its coordinate available through ax.grid lets a step
+            # express causal masks without manually threading loop indices.
+            program_ids = dict(parent_context.program_ids)
+            program_ids[axis_name] = index
+            tile_sizes = dict(parent_context.tile_sizes)
+            tile_sizes[axis_name] = tile_size
+            with kernel_context(program_ids, tile_sizes):
+                return step_fn(carry, step_input)
 
         def body(index, carry):
             return lax.cond(index < limit, lambda value: local_step(value, index), lambda value: value, carry)
