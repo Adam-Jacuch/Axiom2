@@ -327,6 +327,18 @@ class _AxisNamespace(AxisNamespaceStubs):
 
         return wrapper
 
+    @property
+    def grid(self):
+        """Current Pallas program coordinates, indexed by named Axis."""
+        from .kernel import grid
+        return grid
+
+    @property
+    def tile(self):
+        """Current Pallas tile-local register indices, indexed by named Axis."""
+        from .kernel import tile
+        return tile
+
     def __getattr__(self, name: str) -> Axis:
         return Axis(name)
 
@@ -582,6 +594,13 @@ class TargetedTensor(NNTargetedTensorStubs):
     def __init__(self, tensor: 'Tensor', target_axes: Tuple[Axis, ...]):
         self.tensor = tensor
         self.target_axes = target_axes
+
+    def __call__(self, tile_size: int):
+        """Turn a single named target into a tile-aware Pallas axis reference."""
+        if len(self.target_axes) != 1:
+            raise ValueError("Tile one axis at a time, e.g. tensor.b(1).s(128).map(fn).")
+        from .kernel import tile_axis
+        return tile_axis(self.tensor, self.target_axes[0].name, tile_size)
 
     def __getattr__(self, name: str) -> Any:
         """The Universal Dispatcher: Chains axes or dynamically invokes pure JAX/NN primitives."""
@@ -1038,6 +1057,13 @@ class TargetedBundle(NNTargetedBundleStubs):
     def __init__(self, bundle: 'Bundle', target_axes: Tuple[Axis, ...]):
         self.bundle = bundle
         self.target_axes = target_axes
+
+    def __call__(self, tile_size: int):
+        """Create a shared tile plan for every tensor in a parallel Bundle."""
+        if len(self.target_axes) != 1:
+            raise ValueError("Tile one axis at a time, e.g. (q & k).b(1).s(128).map(fn).")
+        from .kernel import tile_axis
+        return tile_axis(self.bundle, self.target_axes[0].name, tile_size)
 
     def __getattr__(self, name: str) -> Any:
         """Universal Dispatcher for Bundles."""
