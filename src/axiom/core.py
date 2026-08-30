@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import operator
 import inspect
+from contextlib import contextmanager
 import jax
 import jax.numpy as jnp
 import jax.nn as jnn
@@ -40,16 +41,38 @@ class CompilerState:
     def __init__(self):
         self.is_initializing = False
         self.params = {}
+        # Kept alongside raw arrays so allocation sites can describe physical
+        # placement without contaminating JAX values with Python metadata.
+        self.param_layouts = {}
         self.param_counter = 0
         self.active_frames = {}
         self.func_calls = {}
         self.tied_scope_override = None
+        # Exported/model application is read-only with respect to parameters.
+        # This remains separate from ``is_initializing`` so exploratory eager
+        # tensor code retains its existing allocation behavior.
+        self.strict_params = False
+        # ``jax.checkpoint`` introduces implementation frames while tracing a
+        # rematerialized function.  Keep its lexical parameter scope explicitly
+        # rather than deriving it from those unstable frames.
+        self.remat_scope_override = None
 
     def reset_pass_state(self):
         """Clears the deterministic trackers at the start of a JAX trace."""
         self.param_counter = 0
         self.active_frames.clear()
         self.func_calls.clear()
+        self.remat_scope_override = None
+
+    @contextmanager
+    def remat_scope(self, scope: str):
+        """Make a checkpointed function's parameter scope trace-stable."""
+        previous = self.remat_scope_override
+        self.remat_scope_override = scope
+        try:
+            yield
+        finally:
+            self.remat_scope_override = previous
 
     def get_scoped_name(self, explicit_name: Optional[str] = None, fallback_prefix: str = "param") -> str:
         """
@@ -62,38 +85,35 @@ class CompilerState:
         if explicit_name is not None and explicit_name.startswith('@'):
             return explicit_name[1:]
 
-        scope_func = "global"
-
-        import sys
-        # 1. Use lightning-fast CPython frame walking
-        frame = sys._getframe(1)
-
-        try:
-            # 2. Walk up the stack, looking ONLY at the function name, not the memory ID
-            while frame:
-                filepath = frame.f_code.co_filename.replace("\\", "/")
-                if "axiom/" not in filepath and "jax/" not in filepath and "optax/" not in filepath:
-                    scope_func = frame.f_code.co_name
-                    break
-                frame = frame.f_back
-
-            # 3. Scope resolution (No more active_frames dictionary!)
-            if self.tied_scope_override:
-                scope_id = self.tied_scope_override
-            else:
+        # Tied scan/repeat scopes must remain the outermost ownership boundary.
+        # Otherwise a remat scope is explicit and independent of JAX's tracing
+        # frames.  Normal eager code keeps the lightweight frame-based name.
+        if self.tied_scope_override:
+            scope_id = self.tied_scope_override
+        elif self.remat_scope_override:
+            scope_id = self.remat_scope_override
+        else:
+            scope_func = "global"
+            import sys
+            frame = sys._getframe(1)
+            try:
+                while frame:
+                    filepath = frame.f_code.co_filename.replace("\\", "/")
+                    if "axiom/" not in filepath and "jax/" not in filepath and "optax/" not in filepath:
+                        scope_func = frame.f_code.co_name
+                        break
+                    frame = frame.f_back
                 scope_id = scope_func
+            finally:
+                # Frame references can retain JAX tracers, so release them at
+                # the end of every naming lookup.
+                del frame
 
-            # 4. Generate the deterministic name
-            if explicit_name:
-                return f"{scope_id}/{explicit_name}"
-            else:
-                p_name = f"{scope_id}/{fallback_prefix}_{self.param_counter}"
-                self.param_counter += 1
-                return p_name
-
-        finally:
-            # 5. Annihilate the frame reference so JAX tracers vaporize instantly
-            del frame
+        if explicit_name:
+            return f"{scope_id}/{explicit_name}"
+        p_name = f"{scope_id}/{fallback_prefix}_{self.param_counter}"
+        self.param_counter += 1
+        return p_name
 
 compiler_state = CompilerState()
 
@@ -105,19 +125,45 @@ class Tie:
 class Axis:
     """Represents a logical dimension in Axiom."""
 
-    def __init__(self, name: str, size: Optional[int] = None):
+    def __init__(self, name: str, size: Optional[int] = None, placement=None, *, replicated: bool = False):
         self.name = name
         self.size = size
-        self.mesh_dim: Optional[str] = None
+        if placement is not None and not getattr(placement, "_axiom_mesh_axis", False):
+            raise TypeError("Axis placement must be a mesh token such as mesh.tp.")
+        if placement is not None and replicated:
+            raise ValueError("An axis cannot be both mesh-sharded and explicitly replicated.")
+        self.placement = placement
+        self.replicated = replicated
+
+    @property
+    def layout_explicit(self) -> bool:
+        """Whether this axis explicitly requests a layout rather than inference."""
+        return self.placement is not None or self.replicated
 
     def __call__(self, size: Any) -> 'Axis':
-        new_ax = Axis(self.name, int(size))
-        new_ax.mesh_dim = self.mesh_dim
-        return new_ax
+        return Axis(self.name, int(size), self.placement, replicated=self.replicated)
+
+    def __getitem__(self, placement) -> 'Axis':
+        """Return an axis template explicitly placed on one mesh dimension."""
+        if placement is None:
+            return Axis(self.name, self.size, replicated=True)
+        if not getattr(placement, "_axiom_mesh_axis", False):
+            raise TypeError("Axis placement uses mesh.tp or None: ax.d[mesh.tp] or ax.d[None].")
+        if self.placement is not None and self.placement != placement:
+            raise ValueError(
+                f"Axis '{self.name}' is already placed on {self.placement}; it cannot also be placed on {placement}."
+            )
+        return Axis(self.name, self.size, placement)
+
+    @property
+    def mesh_dim(self) -> Optional[str]:
+        """Compatibility inspection only; use ``axis.placement`` for new code."""
+        return getattr(self.placement, "name", None)
 
     def shard(self, mesh_dim: str) -> 'Axis':
-        self.mesh_dim = mesh_dim
-        return self
+        raise RuntimeError(
+            "Axis.shard(...) has been removed. Create a mesh and write ax.d[mesh.tp](size) instead."
+        )
 
     def __floordiv__(self, other: int) -> int:
         if self.size is None:
@@ -135,7 +181,8 @@ class Axis:
         return self.size + other
 
     def __repr__(self):
-        return f"Axis({self.name}={self.size})"
+        placement = f"[{self.placement}]" if self.placement is not None else ("[None]" if self.replicated else "")
+        return f"Axis({self.name}{placement}={self.size})"
 
     def __hash__(self):
         return hash(self.name)
@@ -144,13 +191,79 @@ class Axis:
         return isinstance(other, Axis) and self.name == other.name
 
 
+def _resized_axis(axis: Axis, size: Optional[int], *, name: Optional[str] = None, placement=None) -> Axis:
+    """Copy an axis while preserving its layout unless an explicit layout is supplied."""
+    if placement is None:
+        placement = axis.placement
+    return Axis(axis.name if name is None else name, size, placement,
+                replicated=axis.replicated if placement is None else False)
+
+
+def _merged_axis(left: Axis, right: Axis) -> Axis:
+    """Merge two same-named logical axes and make placement conflicts explicit."""
+    if left.name != right.name:
+        raise ValueError("Only axes with the same logical name can be aligned.")
+    if left.size is not None and right.size is not None and left.size != right.size:
+        raise ValueError(f"Axis '{left.name}' has incompatible sizes {left.size} and {right.size}.")
+    if left.placement is not None and right.placement is not None and left.placement != right.placement:
+        raise ValueError(
+            f"Axis '{left.name}' is placed on both {left.placement} and {right.placement}; "
+            "make the communication/resharding boundary explicit."
+        )
+    placed = left.placement or right.placement
+    if placed is not None and (left.replicated or right.replicated):
+        raise ValueError(
+            f"Axis '{left.name}' is explicitly replicated on one operand and sharded on another; "
+            "make the resharding boundary explicit."
+        )
+    return Axis(left.name, left.size if left.size is not None else right.size, placed,
+                replicated=left.replicated or right.replicated)
+
+
+def _decode_parameter_layouts(metadata, mesh):
+    """Restore checkpoint layout descriptors against the receiving mesh.
+
+    Checkpoints store mesh *names*, not device identities, which lets a model
+    be restored onto an equivalent fresh mesh (including a CPU test mesh).
+    """
+    from .layout import ParameterLayout
+
+    def decode_axes(entries):
+        result = []
+        for entry in entries:
+            placement_name = entry.get("placement")
+            if placement_name is not None and mesh is None:
+                raise ValueError(
+                    "Checkpoint contains placed parameters; load into a model constructed with the intended ax.mesh(...)."
+                )
+            placement = getattr(mesh, placement_name) if placement_name is not None else None
+            result.append(Axis(entry["name"], entry.get("size"), placement,
+                               replicated=entry.get("replicated", False)))
+        return tuple(result)
+
+    return {
+        name: ParameterLayout(
+            axes=decode_axes(entry["axes"]),
+            kind=entry.get("kind", "tensor"),
+            input_axes=decode_axes(entry.get("input_axes", ())),
+            output_axes=decode_axes(entry.get("output_axes", ())),
+        )
+        for name, entry in metadata.get("parameters", {}).items()
+    }
+
+
 class _AxisNamespace(AxisNamespaceStubs):
     def __call__(self, name: str, size: Optional[int] = None) -> Axis:
         return Axis(name, size)
 
-    def model(self, fn, params=None) -> 'AxiomModel':
+    def model(self, fn, params=None, *, mesh=None) -> 'AxiomModel':
         from .compiler import AxiomModel
-        return AxiomModel(fn, params)
+        return AxiomModel(fn, params, mesh=mesh)
+
+    def mesh(self, *, devices=None, **axis_sizes):
+        """Create an explicit device mesh used by axis placement annotations."""
+        from .layout import AxiomMesh
+        return AxiomMesh(devices=devices, **axis_sizes)
 
     @property
     def jit(self):
@@ -193,8 +306,9 @@ class _AxisNamespace(AxisNamespaceStubs):
 
         base_top = items[0].topology
         for t in items:
-            if t.topology != base_top:
+            if tuple(axis.name for axis in t.topology) != tuple(axis.name for axis in base_top):
                 raise ValueError(f"Topology mismatch in stack: expected {[a.name for a in base_top]}, got {[a.name for a in t.topology]}.")
+            base_top = tuple(_merged_axis(left, right) for left, right in zip(base_top, t.topology))
 
         import jax.numpy as jnp
         raw_arrays = [t.unwrap() for t in items]
@@ -202,7 +316,8 @@ class _AxisNamespace(AxisNamespaceStubs):
         return wrap(stacked_raw, new_axis, *base_top)
 
     def save(self, target: Any, path: str):
-        """Saves an AxiomModel OR a raw parameter dictionary to disk."""
+        """Save parameters plus portable Axiom layout metadata when available."""
+        import json
         import numpy as np
 
         # Extract params whether it's an AxiomModel or a raw dict
@@ -212,12 +327,22 @@ class _AxisNamespace(AxisNamespaceStubs):
             raise ValueError("Target has no parameters to save.")
 
         numpy_params = {k: np.array(v) for k, v in params.items()}
+        if hasattr(target, "param_layouts"):
+            from .layout import AxiomLayout
+            if getattr(target, "mesh", None) is not None:
+                metadata = target.layout.metadata()
+            else:
+                metadata = {
+                    "mesh_axes": {},
+                    "parameters": {name: layout.metadata() for name, layout in target.param_layouts.items()},
+                }
+            numpy_params["__axiom_layout__"] = np.asarray(json.dumps(metadata))
 
         if not path.endswith('.npz'):
             path += '.npz'
 
         np.savez_compressed(path, **numpy_params)
-        print(f"Saved {len(numpy_params)} parameters to {path}")
+        print(f"Saved {len(params)} parameters to {path}")
 
     def load(self, path: str, *, target: Any = None):
         """
@@ -225,6 +350,7 @@ class _AxisNamespace(AxisNamespaceStubs):
         If 'target' is an AxiomModel, it injects the weights directly.
         If 'target' is None, it returns the raw JAX parameter dictionary.
         """
+        import json
         import numpy as np
         import jax.numpy as jnp
 
@@ -232,12 +358,19 @@ class _AxisNamespace(AxisNamespaceStubs):
             path += '.npz'
 
         loaded = np.load(path)
-        params_dict = {k: jnp.array(loaded[k]) for k in loaded.files}
+        metadata = None
+        if "__axiom_layout__" in loaded.files:
+            metadata = json.loads(str(loaded["__axiom_layout__"].item()))
+        params_dict = {k: jnp.array(loaded[k]) for k in loaded.files if k != "__axiom_layout__"}
 
         # Paradigm 1: AxiomModel Injection
         if target is not None:
             if hasattr(target, 'params'):
                 target.params = params_dict
+                if not getattr(target, "param_layouts", None) and metadata is not None:
+                    target.param_layouts = _decode_parameter_layouts(metadata, getattr(target, "mesh", None))
+                if getattr(target, "mesh", None) is not None:
+                    target.params = target.layout.place_params(target.params)
                 target.is_initialized = True
                 print(f"Loaded {len(target.params)} parameters into model from {path}")
                 return
@@ -294,11 +427,23 @@ class _AxisNamespace(AxisNamespaceStubs):
 
     @property
     def remat(self):
-        """Gradient checkpointing (Transparent during Ghost Pass to prevent Tracer leaks)."""
+        """Gradient checkpointing with deterministic parameter ownership.
+
+        A checkpointed function is retraced by JAX during its backward pass.
+        Its parameters therefore use an explicit lexical scope while the body
+        runs, rather than inferring one from JAX's transient Python frames.
+        This keeps names, sharding metadata, tied parameters, and checkpoints
+        identical in eager, ``jit``, and reverse-mode execution.
+        """
         import jax
         from functools import wraps
 
         def wrapper(func):
+            # ``__qualname__`` distinguishes two independently defined local
+            # ``block`` functions while remaining stable when a model factory
+            # is reconstructed for checkpoint restore.
+            scope = func.__qualname__
+
             # A pure inner function that explicitly accepts the parameter dictionary
             def pure_func(params_dict, *args, **kwargs):
                 # 1. Swap the global state to the explicitly tracked JAX parameters
@@ -306,7 +451,8 @@ class _AxisNamespace(AxisNamespaceStubs):
                 compiler_state.params = params_dict
 
                 try:
-                    res = func(*args, **kwargs)
+                    with compiler_state.remat_scope(scope):
+                        res = func(*args, **kwargs)
                 finally:
                     # 2. Safely restore
                     compiler_state.params = prev_params
@@ -315,12 +461,13 @@ class _AxisNamespace(AxisNamespaceStubs):
 
             @wraps(func)
             def inner(*args, **kwargs):
-                if compiler_state.is_initializing:
-                    # Ghost Pass: Execute purely so JAX doesn't inject Tracers
-                    return func(*args, **kwargs)
-                else:
-                    # Trace Pass: Explicitly pass the global params through the checkpoint boundary!
-                    # JAX now tracks them as formal inputs, completely preventing the residual leak!
+                with compiler_state.remat_scope(scope):
+                    if compiler_state.is_initializing:
+                        # Ghost Pass: allocate eagerly, with the exact same
+                        # scope that the later checkpoint trace will use.
+                        return func(*args, **kwargs)
+                    # Explicitly pass the global params through the checkpoint
+                    # boundary so JAX can rematerialize without residual leaks.
                     return jax.checkpoint(pure_func)(compiler_state.params, *args, **kwargs)
 
             return inner
@@ -344,14 +491,6 @@ class _AxisNamespace(AxisNamespaceStubs):
 
 
 ax = _AxisNamespace()
-
-
-class Mesh:
-    """Hardware topology definition for distributed XLA sharding."""
-
-    def __init__(self, devices, axis_names):
-        self.devices = devices
-        self.axis_names = axis_names
 
 
 class SlicedMonad:
@@ -595,6 +734,14 @@ class TargetedTensor(NNTargetedTensorStubs):
         self.tensor = tensor
         self.target_axes = target_axes
 
+    @property
+    def topology(self):
+        """Expose the annotated tensor topology for inspection/export helpers."""
+        return self.tensor.topology
+
+    def unwrap(self):
+        return self.tensor.unwrap()
+
     def __call__(self, tile_size: int):
         """Turn a single named target into a tile-aware Pallas axis reference."""
         if len(self.target_axes) != 1:
@@ -662,7 +809,11 @@ class TargetedTensor(NNTargetedTensorStubs):
                     # Look for it in the current tensor's topology
                     for current_ax in self.tensor.topology:
                         if current_ax.name == tgt_ax.name:
-                            resolved_axes.append(current_ax)
+                            resolved_axes.append(
+                                Axis(tgt_ax.name, current_ax.size, tgt_ax.placement,
+                                     replicated=tgt_ax.replicated)
+                                if tgt_ax.layout_explicit else current_ax
+                            )
                             break
                     else:
                         raise ValueError(f"Cannot project into '{tgt_ax.name}' without a size.")
@@ -678,7 +829,17 @@ class TargetedTensor(NNTargetedTensorStubs):
         out_dim = np.prod([a.size for a in target_axes])
         initializer = init if init is not None else ax_init.xavier
 
-        W_raw = state.get_param("proj_w", (in_dim, out_dim), initializer, tie=tie, fan_in=in_dim, fan_out=out_dim)
+        from .layout import ParameterLayout
+        weight_layout = ParameterLayout(
+            axes=(Axis("_in", in_dim), Axis("_out", out_dim)),
+            kind="projection",
+            input_axes=tuple(self.target_axes),
+            output_axes=tuple(target_axes),
+        )
+        W_raw = state.get_param(
+            "proj_w", (in_dim, out_dim), initializer, tie=tie, fan_in=in_dim, fan_out=out_dim,
+            layout=weight_layout,
+        )
         W_param = Tensor(W_raw, Axis("_in", in_dim), Axis("_out", out_dim))
 
         kept_axes = tuple(a for a in self.tensor.topology if a not in self.target_axes)
@@ -704,7 +865,11 @@ class TargetedTensor(NNTargetedTensorStubs):
         from . import init as ax_init
         initializer = init if init is not None else ax_init.zeros
         shape = tuple(a.size for a in self.target_axes)
-        b_raw = state.get_param("bias", shape, initializer, tie=tie)
+        from .layout import ParameterLayout
+        b_raw = state.get_param(
+            "bias", shape, initializer, tie=tie,
+            layout=ParameterLayout(tuple(self.target_axes)),
+        )
         return self.tensor + Tensor(b_raw, *self.target_axes)
 
     def gate(self, init=None, tie: Optional[str] = None) -> 'Tensor':
@@ -712,7 +877,11 @@ class TargetedTensor(NNTargetedTensorStubs):
         from . import init as ax_init
         initializer = init if init is not None else ax_init.ones
         shape = tuple(a.size for a in self.target_axes)
-        g_raw = state.get_param("gate", shape, initializer, tie=tie)
+        from .layout import ParameterLayout
+        g_raw = state.get_param(
+            "gate", shape, initializer, tie=tie,
+            layout=ParameterLayout(tuple(self.target_axes)),
+        )
         return self.tensor * Tensor(g_raw, *self.target_axes)
 
     def mask(self, func, fill: float) -> 'Tensor':
@@ -744,7 +913,13 @@ class TargetedTensor(NNTargetedTensorStubs):
                 f"into '{new_axis.name}' of size {new_axis.size}."
             )
 
-        final_axis = Axis(new_axis.name, total_size)
+        source_placements = {axis.placement for axis in self.target_axes if axis.placement is not None}
+        if source_placements and new_axis.placement is None and not new_axis.replicated:
+            raise ValueError(
+                f"Merging placed axis/axes {[axis.name for axis in self.target_axes]} requires an explicit "
+                f"target placement, e.g. ax.{new_axis.name}[mesh.<axis>](...)."
+            )
+        final_axis = Axis(new_axis.name, total_size, new_axis.placement, replicated=new_axis.replicated)
 
         kept_axes = tuple(a for a in self.tensor.topology if a not in self.target_axes)
         transpose_order = [self.tensor.topology.index(a) for a in kept_axes + self.target_axes]
@@ -794,11 +969,19 @@ class TargetedTensor(NNTargetedTensorStubs):
             # Replace the unknown axis with a strictly sized one
             for i, a in enumerate(final_new_axes):
                 if a.size is None:
-                    final_new_axes[i] = Axis(a.name, inferred_size)
+                    final_new_axes[i] = _resized_axis(a, inferred_size)
         else:
             if target_ax.size is not None and known_size != target_ax.size:
                 raise ValueError(
                     f"Topological Violation: Cannot split axis of size {target_ax.size} into {known_size}.")
+
+        if target_ax.placement is not None:
+            placed_outputs = [axis for axis in final_new_axes if axis.placement == target_ax.placement]
+            if len(placed_outputs) != 1:
+                raise ValueError(
+                    f"Splitting placed axis '{target_ax.name}' requires exactly one output axis placed on "
+                    f"{target_ax.placement}, e.g. ax.h[{target_ax.placement}](...)."
+                )
 
         ax_idx = self.tensor.topology.index(target_ax)
         raw_shape = self.tensor.unwrap().shape
@@ -823,7 +1006,7 @@ class TargetedTensor(NNTargetedTensorStubs):
         new_topology = list(self.tensor.topology)
         new_topology.pop(ax_idx)
         new_topology.insert(ax_idx, window_axis)
-        new_topology.insert(ax_idx, Axis(spatial_ax.name, out_size))
+        new_topology.insert(ax_idx, _resized_axis(spatial_ax, out_size))
 
         return Tensor(unfolded_raw, *new_topology)
 
@@ -901,7 +1084,7 @@ class TargetedTensor(NNTargetedTensorStubs):
         for target, (before, after) in zip(self.target_axes, pad_widths):
             ax_idx = self.tensor.topology.index(target)
             pad_width_full[ax_idx] = (before, after)
-            new_topology[ax_idx] = Axis(target.name, (target.size + before + after) if target.size else None)
+            new_topology[ax_idx] = _resized_axis(target, (target.size + before + after) if target.size else None)
 
         return Tensor(jnp.pad(self.tensor.unwrap(), pad_width_full, constant_values=fill), *new_topology)
 
@@ -911,7 +1094,10 @@ class TargetedTensor(NNTargetedTensorStubs):
             raise ValueError(f"Topological Violation: .rename() cannot change axis sizes.")
 
         new_topology = list(self.tensor.topology)
-        new_topology[self.tensor.topology.index(target)] = Axis(new_axis.name, target.size)
+        replacement = new_axis if new_axis.layout_explicit else target
+        new_topology[self.tensor.topology.index(target)] = Axis(
+            new_axis.name, target.size, replacement.placement, replicated=replacement.replicated
+        )
         return Tensor(self.tensor.unwrap(), *new_topology)
 
     def _reduce(self, jnp_func) -> 'Tensor':
@@ -1000,6 +1186,22 @@ class TargetedTensor(NNTargetedTensorStubs):
         """Allows shape-safe slicing, integer indexing, and routed gathering."""
         import jax.numpy as jnp
 
+        # Placement has priority over numerical indexing so the two compose:
+        # ``x.d[mesh.tp][:128]`` is a placed view followed by an ordinary
+        # Axiom slice, while bare ``x.d[:128]`` remains unchanged.
+        if item is None or getattr(item, "_axiom_mesh_axis", False):
+            if len(self.target_axes) != 1:
+                raise ValueError("Place one logical axis at a time, e.g. x.d[mesh.tp] or x.d[None].")
+            target_ax = self.target_axes[0]
+            if item is not None and target_ax.placement is not None and target_ax.placement != item:
+                raise ValueError(
+                    f"Axis '{target_ax.name}' is already placed on {target_ax.placement}; cannot assert {item}."
+                )
+            placed_axis = Axis(target_ax.name, target_ax.size, item, replicated=item is None)
+            placed_topology = tuple(placed_axis if axis == target_ax else axis for axis in self.tensor.topology)
+            placed_tensor = Tensor(self.tensor.unwrap(), *placed_topology)
+            return TargetedTensor(placed_tensor, (placed_axis,))
+
         # 1. Monad Stitching Fallback
         if isinstance(item, slice) and item == slice(None):
             return self.tensor
@@ -1031,8 +1233,7 @@ class TargetedTensor(NNTargetedTensorStubs):
             start, stop, step = item.indices(target_ax.size)
             new_size = len(range(start, stop, step))
 
-            from .core import Axis
-            new_ax = Axis(target_ax.name, new_size)
+            new_ax = _resized_axis(target_ax, new_size)
             new_topology = tuple(new_ax if a == target_ax else a for a in base_tensor.topology)
 
             chunk_tensor = Tensor(sliced_raw, *new_topology)
@@ -1086,6 +1287,17 @@ class TargetedBundle(NNTargetedBundleStubs):
 
     def __getitem__(self, key: Any) -> 'Bundle':
         """Parallel patch/slicing across the bundle."""
+        if key is None or getattr(key, "_axiom_mesh_axis", False):
+            if len(self.target_axes) != 1:
+                raise ValueError("Place one logical axis at a time, e.g. (q & k).h[mesh.tp] or .h[None].")
+            placed_tensors = []
+            for tensor in self.bundle.tensors:
+                placed = TargetedTensor(tensor, self.target_axes)[key]
+                placed_tensors.append(placed.tensor)
+            placed_bundle = Bundle(*placed_tensors)
+            target_name = self.target_axes[0].name
+            placed_axis = next(axis for axis in placed_tensors[0].topology if axis.name == target_name)
+            return TargetedBundle(placed_bundle, (placed_axis,))
         results = [TargetedTensor(t, self.target_axes)[key] for t in self.bundle.tensors]
         return Bundle(*results)
 
@@ -1232,6 +1444,19 @@ class TargetedBundle(NNTargetedBundleStubs):
 
         target_ax = self.target_axes[0]
         base_top = self.bundle.tensors[0].topology
+        for tensor in self.bundle.tensors[1:]:
+            if tuple(axis.name for axis in tensor.topology) != tuple(axis.name for axis in base_top):
+                raise ValueError("Cannot join tensors with different logical axis names/order.")
+            merged = []
+            for left, right in zip(base_top, tensor.topology):
+                # The joined axis intentionally has a different extent in
+                # each bundle member; only its placement must agree.
+                if left.name == target_ax.name:
+                    merged.append(_merged_axis(_resized_axis(left, None), _resized_axis(right, None)))
+                else:
+                    merged.append(_merged_axis(left, right))
+            base_top = tuple(merged)
+        target_ax = base_top[base_top.index(target_ax)]
 
         raw_arrays = []
         for t in self.bundle.tensors:
@@ -1252,10 +1477,9 @@ class TargetedBundle(NNTargetedBundleStubs):
         # Calculate the new total size along the joined axis
         total_size = sum(t.topology[t.topology.index(target_ax)].size for t in self.bundle.tensors)
 
-        # Build the new topology using base_top!
-        from .core import Axis  # (ensure Axis is available, though it usually is in this file)
+        # Build the new topology using base_top and retain the target layout.
         new_topology = list(base_top)
-        new_topology[ax_idx] = Axis(target_ax.name, total_size)
+        new_topology[ax_idx] = _resized_axis(target_ax, total_size)
 
         return Tensor(jnp.concatenate(raw_arrays, axis=ax_idx), *new_topology)
 
@@ -1420,6 +1644,8 @@ class Tensor(NNTensorStubs):
 
     def _validate_topology(self):
         seen_names = set()
+        seen_mesh_dimensions = set()
+        mesh_ids = set()
         for axis in self._axes:
             if axis.name in seen_names:
                 raise ValueError(
@@ -1428,6 +1654,16 @@ class Tensor(NNTensorStubs):
                     f"you must use .rename() to differentiate them (e.g., '{axis.name}_1', '{axis.name}_2')."
                 )
             seen_names.add(axis.name)
+            if axis.placement is not None:
+                mesh_ids.add(axis.placement.mesh_id)
+                if axis.placement.name in seen_mesh_dimensions:
+                    raise ValueError(
+                        f"Mesh axis '{axis.placement.name}' is assigned to more than one tensor dimension. "
+                        "Split/merge logical axes so every physical dimension has a unique mesh axis."
+                    )
+                seen_mesh_dimensions.add(axis.placement.name)
+        if len(mesh_ids) > 1:
+            raise ValueError("A Tensor cannot combine axes from different ax.mesh() instances.")
 
         if hasattr(self._tensor, 'shape'):
             if len(self._tensor.shape) != len(self._axes):
@@ -1505,7 +1741,22 @@ class Tensor(NNTensorStubs):
         else:
             # Eager execution: Safe to allocate memory
             if true_name not in compiler_state.params:
+                if compiler_state.strict_params:
+                    raise RuntimeError(
+                        f"Axiom parameter '{true_name}' is missing from an initialized model/exported parameter "
+                        "dictionary. Reinitialize the model or pass the complete parameter tree."
+                    )
                 compiler_state.params[true_name] = self.unwrap()
+
+        from .layout import ParameterLayout
+        layout = ParameterLayout(tuple(self.topology))
+        existing_layout = compiler_state.param_layouts.get(true_name)
+        if existing_layout is None:
+            compiler_state.param_layouts[true_name] = layout
+        elif existing_layout.metadata() != layout.metadata():
+            raise ValueError(
+                f"Tied parameter '{true_name}' was requested with incompatible axis placement metadata."
+            )
 
         return Tensor(compiler_state.params[true_name], *self.topology)
 
@@ -1613,7 +1864,11 @@ class Tensor(NNTensorStubs):
     def _get_union_topology(self, other: 'Tensor') -> Tuple[Axis, ...]:
         union = list(self._axes)
         for ax_other in other.topology:
-            if ax_other not in union: union.append(ax_other)
+            if ax_other not in union:
+                union.append(ax_other)
+            else:
+                index = union.index(ax_other)
+                union[index] = _merged_axis(union[index], ax_other)
         return tuple(union)
 
     def _align_to(self, target_axes: Tuple[Axis, ...]) -> Any:
@@ -1772,8 +2027,18 @@ def decay_monads(x):
     return x
 
 
-jax.tree_util.register_pytree_node(
-    Tensor,
-    lambda t: ((t.unwrap(),), (t.topology,)),
-    lambda aux, children: Tensor(children[0], *aux[0])
-)
+def _flatten_tensor(tensor):
+    # Axis equality is intentionally name-based for named contraction.  The
+    # PyTree auxiliary data must additionally include placement, otherwise JAX
+    # could incorrectly reuse a compiled executable for ``d[dp]`` and
+    # ``d[tp]`` tensors with the same shape.
+    axis_data = tuple((axis.name, axis.size, axis.placement, axis.replicated) for axis in tensor.topology)
+    return (tensor.unwrap(),), axis_data
+
+
+def _unflatten_tensor(axis_data, children):
+    return Tensor(children[0], *(Axis(name, size, placement, replicated=replicated)
+                                 for name, size, placement, replicated in axis_data))
+
+
+jax.tree_util.register_pytree_node(Tensor, _flatten_tensor, _unflatten_tensor)

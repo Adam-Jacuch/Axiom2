@@ -104,7 +104,8 @@ model = ax.model(f)
 optim = optax.sgd(1e-3, momentum=0.9)
 state = None
 
-# or ax.jit(shard=[ax.b, ax.d]) for FSDP, or @ax.jit(static_argnames=var) for conditions
+# For multi-device execution: mesh = ax.mesh(dp=..., tp=...), annotate axes
+# (for example ax.b[mesh.dp](...)), then use @ax.jit(mesh=mesh).
 @ax.jit # call axiom jit rather than jax jit if you use an axiom model so that implicit parameters get allocated properly
 def step(model, state, x, y):
     def loss_fn(model):

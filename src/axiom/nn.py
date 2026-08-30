@@ -180,7 +180,7 @@ def infonce_loss(query: Tensor, key: Tensor, batch_ax: 'Axis', temp: float = 0.0
     from . import init
 
     # 1. Rename the key's batch axis to prevent it from broadcasting linearly!
-    batch_ax_k = Axis(batch_ax.name + "_k", batch_ax.size)
+    batch_ax_k = Axis(batch_ax.name + "_k", batch_ax.size, batch_ax.placement, replicated=batch_ax.replicated)
     key_renamed = TargetedTensor(key, (batch_ax,)).rename(batch_ax_k)
 
     # 2. Compute similarities
@@ -244,7 +244,11 @@ def embed(tokens: Tensor, vocab_ax: 'Axis', embed_ax: 'Axis', tie: str = None, i
     initializer = init if init is not None else default_init
 
     # 1. Allocate the continuous weight matrix (vocab_size, d_model)
-    emb_raw = state.get_param("embedding", (vocab_ax.size, embed_ax.size), initializer, tie=tie)
+    from .layout import ParameterLayout
+    emb_raw = state.get_param(
+        "embedding", (vocab_ax.size, embed_ax.size), initializer, tie=tie,
+        layout=ParameterLayout((vocab_ax, embed_ax)),
+    )
     embedding_matrix = Tensor(emb_raw, vocab_ax, embed_ax)
 
     # 2. Use our beautifully restored RoutedContext to safely gather the vectors!
@@ -287,7 +291,7 @@ def rope(targeted: TargetedTensor, seq_ax: 'Axis', tie: str = None, base: float 
     if rot_fraction < 1.0:
         x_rot = targeted[:rot_dim]
         x_pass = targeted[rot_dim:]
-        rot_ax = Axis(feat_ax.name, rot_dim)
+        rot_ax = Axis(feat_ax.name, rot_dim, feat_ax.placement, replicated=feat_ax.replicated)
     else:
         x_rot = x
         x_pass = None

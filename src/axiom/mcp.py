@@ -82,11 +82,16 @@ def axiom_ghost_pass_oracle(code_snippet: str, input_topology: dict) -> str:
         # 4. Evaluate the AI's proposed code!
         result = smart_eval(code_snippet, local_context)
 
-        # 5. Extract and return the mathematical proof of the shape
+        # 5. Extract and return a compact mathematical proof of the shape.
+        # Keep this independent of Axis.__repr__ so MCP output remains stable
+        # when implementation metadata (such as mesh placement) evolves.
+        def format_topology(topology):
+            return "(" + ", ".join(f"'{axis.name}'={axis.size}" for axis in topology) + ")"
+
         if hasattr(result, 'topology'):
-            return f"Success! Output Topology: {result.topology}"
+            return f"Success! Output Topology: {format_topology(result.topology)}"
         elif hasattr(result, 'tensors'):  # Handle parallel Bundles!
-            tops = [t.topology for t in result.tensors]
+            tops = [format_topology(t.topology) for t in result.tensors]
             return f"Success! Output is a Bundle with Topologies:\n{tops}"
         else:
             return f"Code executed, but output is not an Axiom Tensor. Type: {type(result)}"
@@ -107,6 +112,7 @@ def tracer_leak_autopsy(code_snippet: str, input_topology: dict) -> str:
         # 1. Reset state
         compiler_state.reset_pass_state()
         compiler_state.params.clear()
+        compiler_state.param_layouts.clear()
 
         local_context = {"ax": ax, "nn": nn, "jnp": jnp}
 
@@ -176,6 +182,7 @@ def xla_memory_interrogator(code_snippet: str, input_topology: dict) -> str:
     try:
         compiler_state.reset_pass_state()
         compiler_state.params.clear()
+        compiler_state.param_layouts.clear()
 
         kwargs = {}
         for var_name, axes_info in input_topology.items():
@@ -372,6 +379,7 @@ def compute_density_profiler(architecture_code: str, input_topology: dict) -> st
     try:
         compiler_state.reset_pass_state()
         compiler_state.params.clear()
+        compiler_state.param_layouts.clear()
         local_context = {"ax": ax, "nn": nn, "jnp": jnp}
 
         kwargs = {}
@@ -592,6 +600,7 @@ def axiom_scope_debugger(architecture_code: str, input_topology: dict) -> str:
     try:
         compiler_state.reset_pass_state()
         compiler_state.params.clear()
+        compiler_state.param_layouts.clear()
         local_context = {"ax": ax, "nn": nn, "jnp": jnp}
 
         kwargs = {}
@@ -977,7 +986,8 @@ model = ax.model(f)
 optim = optax.sgd(1e-3, momentum=0.9)
 state = None
 
-# or ax.jit(shard=[ax.b, ax.d]) for FSDP, or @ax.jit(static_argnames=var) for conditions
+# For distributed execution, use mesh = ax.mesh(dp=..., tp=...), annotate
+# logical axes with mesh tokens, and compile with @ax.jit(mesh=mesh).
 @ax.jit # call axiom jit rather than jax jit if you use an axiom model so that implicit parameters get allocated properly
 def step(model, state, x, y):
     def loss_fn(model):

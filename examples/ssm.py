@@ -17,7 +17,8 @@ model = ax.model(ssm)
 optim = optax.adamw(1e-3)
 state = None
 
-# or something like @ax.jit(shard=[ax.d]) if you want to shard
+# For sharding, create an explicit mesh and place the owning logical axis:
+# mesh = ax.mesh(tp=...); d = ax.d[mesh.tp](...); @ax.jit(mesh=mesh)
 @ax.jit
 def step(model, state, x, y):
     def loss_fn(model):

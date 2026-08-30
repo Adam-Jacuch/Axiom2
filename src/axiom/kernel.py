@@ -154,6 +154,8 @@ class TiledAxisRef:
             if len(sizes) != 1:
                 raise ValueError(f"Bundle axis '{name}' has inconsistent sizes: {sorted(sizes)}.")
             axis_size = next(iter(sizes))
+            if axis_size <= 0:
+                raise ValueError(f"Axis '{name}' must have a positive size before it can be tiled.")
 
     def _with_axis(self, axis_name: str, tile_size: int) -> "AxisStream":
         if axis_name in self._tiles:
@@ -197,7 +199,8 @@ class TiledAxisRef:
             _ceil_div(canonical_axes[name].size, self._tiles[name]) for name in grid_axes
         )
         local_topologies = tuple(
-            tuple(Axis(axis.name, self._tiles.get(axis.name, axis.size)) for axis in tensor.topology)
+            tuple(Axis(axis.name, self._tiles.get(axis.name, axis.size), axis.placement,
+                       replicated=axis.replicated) for axis in tensor.topology)
             for tensor in input_tensors
         )
 
@@ -412,7 +415,9 @@ class TiledAxisRef:
                 padded = jnp.pad(tensor.unwrap(), tuple(padding))
                 raw = lax.dynamic_slice_in_dim(padded, index * tile_size, tile_size, axis=axis_position)
                 topology = list(tensor.topology)
-                topology[axis_position] = Axis(axis_name, tile_size)
+                original_axis = topology[axis_position]
+                topology[axis_position] = Axis(axis_name, tile_size, original_axis.placement,
+                                                replicated=original_axis.replicated)
                 local_tensors.append(Tensor(raw, *topology))
             step_input = _rebuild_source(self._source, local_tensors)
             parent_context = _KERNEL_CONTEXT.get()
@@ -448,13 +453,15 @@ def tile_axis(source, axis_name: str, tile_size: int) -> AxisStream:
 
 
 def _canonical_axes(tensors: Sequence) -> dict[str, Any]:
+    from .core import _merged_axis
+
     axes: dict[str, Any] = {}
     for tensor in tensors:
         for axis in tensor.topology:
             previous = axes.get(axis.name)
             if previous is not None and previous.size != axis.size:
                 raise ValueError(f"Axis '{axis.name}' has inconsistent sizes across tiled inputs.")
-            axes[axis.name] = axis
+            axes[axis.name] = axis if previous is None else _merged_axis(previous, axis)
     return axes
 
 
@@ -475,7 +482,8 @@ def _global_output_topology(local_topology, canonical_axes: Mapping[str, Any], t
                 f"Output axis '{axis.name}' has local size {axis.size}; expected {expected_local_size}. "
                 "A tiled map must preserve its declared block geometry."
             )
-        global_axes.append(Axis(axis.name, canonical.size))
+        global_axes.append(Axis(axis.name, canonical.size, canonical.placement,
+                                replicated=canonical.replicated))
     return tuple(global_axes)
 
 

@@ -35,6 +35,77 @@ pip install -e ".[cuda13]"  # Replace cuda13 with your target hardware
 
 ---
 
+## 🌐 Explicit multi-device layouts
+
+Distributed placement is attached to the logical axes that own it. Create one
+explicit mesh, annotate axes with its tokens, and keep ordinary slicing exactly
+as it is. A logical axis is placed on at most one mesh axis; represent a true
+2D decomposition by splitting it into two named logical axes.
+
+```python
+import jax.numpy as jnp
+from axiom import ax, init, nn
+
+mesh = ax.mesh(dp=8, tp=8)
+dp, tp = mesh.dp, mesh.tp
+
+b, s = ax.b[dp](1024), ax.s(2048)
+d, h, hd = ax.d(8192), ax.h[tp](64), ax.hd(128)
+
+def megatron_mha(x):
+    # Column-parallel QKV: heads are partitioned over tp.
+    qkv = x.d.proj(ax.qkv(3), h, hd)
+    q, k, v = qkv.qkv
+    k, v = (k & v).s.rename(ax.sk)
+
+    scores = (q.hd @ k) / (hd.size ** 0.5)
+    scores = scores.s.sk.mask(lambda query, key: key > query, fill=-jnp.inf)
+    context = scores.sk.softmax().sk @ v
+
+    # Row-parallel output projection: merge back to a tp-sharded feature
+    # axis, then return a replicated residual feature axis.
+    context = context.h.hd.merge(ax.d[tp](d.size))
+    return x + context.d[tp].proj(ax.d[None])
+
+model = ax.model(megatron_mha, mesh=mesh).init(b, s, d)
+x = init.normal(b, s, d)
+
+@ax.jit(mesh=mesh)
+def forward(model, x):
+    return model(x)
+
+# Placement and ordinary Axiom slices compose naturally.
+prefix = x.d[tp][:128]
+```
+
+`ax.jit(shard=...)` and mutable `Axis.shard(...)` are removed. They guessed a
+mesh from a positional list and could not describe parameter or optimizer
+layouts. The explicit form above is the single sharding API.
+
+Use `None` to explicitly require replication while still inferring an axis
+size: `x.d[tp].proj(ax.d[None])` is a row-parallel TP→replicated projection.
+When that output axis is not already present, give it a size once—for example
+`x.ff[tp].proj(ax.d(D)[None])`.
+
+For native JAX/Optax pipelines, request the layout companion when exporting:
+
+```python
+params, apply_fn, layout = ax.to_jax(model, sharding=True)
+params = layout.place_params(params)
+opt_state = optimizer.init(params)  # zeros_like state inherits parameter placement
+
+# For a custom optimizer state tree, use the same rules explicitly.
+opt_state = layout.place_state(opt_state, params)
+```
+
+`layout.parameter_specs(params)`, `layout.parameter_shardings(params)`,
+`layout.input_sharding(tensor)`, and `layout.output_sharding(tensor)` expose
+the exact JAX objects used at the boundary. Axiom checkpoints save this logical
+layout metadata and re-place parameters on the receiving mesh during
+`ax.load(..., target=model)`.
+
+---
+
 ## 🧠 The Core Philosophy
 
 In Axiom, tensors are aware of their own topology. You don't perform operations on shapes; you target specific axes. 
@@ -104,6 +175,8 @@ def mutate_prefix(x: Tensor) -> Tensor:
 ## ⚙️ Named-Axis Pallas Kernels
 
 Axiom can lower tiled named-axis programs to `jax.experimental.pallas.pallas_call` without exposing positional `BlockSpec` boilerplate. Tile the axes that own the parallel output, then use `.map()` to define one Pallas program. Bundles remain bundles inside the kernel body.
+
+For a complete DP×TP decoder training example, see [megatron_flash_transformer.py](examples/megatron_flash_transformer.py): it implements causal FlashAttention-2 directly with named `.map()`/`.fold()` and trains it through native JAX/Optax sharding trees.
 
 ```python
 out = (left & right).m(128).n(128).map(

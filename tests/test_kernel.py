@@ -173,6 +173,85 @@ def test_non_divisible_axis_boundary_padding():
     assert jnp.array_equal(jax.grad(loss)(x.unwrap()), jnp.full((14,), 2.0))
 
 
+def test_multiaxis_tail_tiles_keep_grid_and_register_coordinates_correct():
+    b, s = ax.b(3), ax.s(5)
+    x = wrap(jnp.arange(b.size * s.size, dtype=jnp.float32).reshape(b.size, s.size), b, s)
+
+    def decorate_tile(block):
+        raw = (
+            block.unwrap() * 2.0
+            + ax.grid[b] * 100.0
+            + ax.grid[s] * 10.0
+            + ax.tile[s][None, :]
+        )
+        return Tensor(raw, *block.topology)
+
+    actual = x.b(2).s(4).map(decorate_tile)
+    expected = jnp.asarray(
+        [
+            [2.0 * x.unwrap()[i, j] + 100.0 * (i // 2) + 10.0 * (j // 4) + (j % 4)
+             for j in range(s.size)]
+            for i in range(b.size)
+        ]
+    )
+
+    assert actual.topology == x.topology
+    assert jnp.array_equal(actual.unwrap(), expected)
+
+
+def test_tile_can_be_larger_than_the_axis_and_bundle_vjp_handles_tail_blocks():
+    tiny = wrap(jnp.arange(3, dtype=jnp.float32), ax.s(3))
+    assert jnp.array_equal(tiny.s(4).map(lambda block: block * 2.0).unwrap(), tiny.unwrap() * 2.0)
+
+    def loss(left_raw, right_raw):
+        left = wrap(left_raw, ax.s(5))
+        right = wrap(right_raw, ax.s(5))
+
+        def multiply_and_add(pair):
+            left_tile, right_tile = pair
+            return (left_tile * right_tile) & (left_tile + right_tile)
+
+        product, total = (left & right).s(4).map(multiply_and_add)
+        return product.s.sum().unwrap() + total.s.sum().unwrap()
+
+    left = jnp.arange(5, dtype=jnp.float32)
+    right = jnp.arange(5, dtype=jnp.float32) + 10.0
+    grad_left, grad_right = jax.grad(ax.remat(loss), argnums=(0, 1))(left, right)
+
+    assert jnp.array_equal(grad_left, right + 1.0)
+    assert jnp.array_equal(grad_right, left + 1.0)
+
+
+def test_fold_supports_raw_and_axiom_tensor_carries():
+    x = wrap(jnp.arange(5, dtype=jnp.float32), ax.s(5))
+
+    raw_total = x.s(2).fold(
+        lambda carry, tile: carry + jnp.sum(tile.unwrap()),
+        init=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    tensor_total = x.s(2).fold(
+        lambda carry, tile: carry + tile.s.sum(),
+        init=wrap(jnp.asarray(0.0, dtype=jnp.float32)),
+    )
+
+    assert jnp.allclose(raw_total, 10.0)
+    assert tensor_total.topology == ()
+    assert jnp.allclose(tensor_total.unwrap(), 10.0)
+
+
+def test_kernel_rejects_ambiguous_output_ownership_and_invalid_tile_plans():
+    x = wrap(jnp.ones((2, 4), dtype=jnp.float32), ax.b(2), ax.s(4))
+
+    with pytest.raises(ValueError, match="omits grid axis"):
+        x.s(2).map(lambda block: block.s.sum())
+    with pytest.raises(ValueError, match="positive integer"):
+        x.s(2).fold(lambda carry, block: carry, init=0, stages=0)
+    with pytest.raises(ValueError, match="one tiled axis"):
+        x.b(1).s(2).fold(lambda carry, block: carry, init=0)
+    with pytest.raises(ValueError, match="positive size"):
+        wrap(jnp.empty((0,), dtype=jnp.float32), ax.empty(0)).empty(2)
+
+
 def test_mixed_precision_fold_accumulates_in_float32_then_casts_back():
     x = wrap(jnp.ones((8, 8), dtype=jnp.bfloat16), ax.m(8), ax.k(8))
 
